@@ -4,6 +4,7 @@ import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Bundle
 import android.util.Log
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.platform.ComposeView
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
@@ -14,6 +15,7 @@ import com.meta.spatial.core.Color4
 import com.meta.spatial.core.Entity
 import com.meta.spatial.core.Pose
 import com.meta.spatial.core.Quaternion
+import com.meta.spatial.core.Query
 import com.meta.spatial.core.SpatialFeature
 import com.meta.spatial.core.Vector2
 import com.meta.spatial.core.Vector3
@@ -56,8 +58,13 @@ import com.meta.spatial.toolkit.Transform
 import com.meta.spatial.toolkit.UIPanelSettings
 import com.meta.spatial.toolkit.VideoSurfacePanelRegistration
 import com.meta.spatial.toolkit.Visible
+import com.meta.spatial.vr.LocomotionSystem
 import com.meta.spatial.vr.VRFeature
 import java.io.File
+import kotlin.math.PI
+import kotlin.math.atan2
+import kotlin.math.max
+import kotlin.math.min
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -111,10 +118,30 @@ class ImmersiveActivity : AppSystemActivity() {
     private val audioPlayers = mutableListOf<ExoPlayer>()
     private var nextAudioSessionSlot = 1
 
+    // Disposable IDs for runtime-registered per-source audio icon panels. Starts above the
+    // video panel id range (2_000_000) so we don't collide with [nextVideoPanelId] (1_500_000+)
+    // or any compile-time resource id.
+    private var nextAudioIconPanelId: Int = 2_000_000
+
     // Global mute toggled by the floating mute-button panel. Affects both audio emitters
     // (spatial audio via the underlying ExoPlayer.volume) and video panel players. Flipped
     // by [toggleAudio]; the button glyph is driven by [muteButtonState].
     private var audioMuted = false
+
+    // Custom locomotion replacing the SDK's default teleport-on-thumbstick-release. Built in
+    // [onSceneReady] after disabling the default [LocomotionSystem]. The reference is kept so
+    // every external `scene.setViewOrigin` call can be mirrored into the system's cached
+    // (currentX, currentY, currentZ, currentYawDeg) via [SmoothLocomotionSystem.syncFromScene]
+    // — otherwise the next frame of stick input would jump the player back to stale state.
+    private var smoothLocomotion: SmoothLocomotionSystem? = null
+
+    // Click-to-animated-move tween for the player view origin. Coexists with [smoothLocomotion]:
+    // sticks still drive continuous walking, while trigger-clicks on the gallery floor animate
+    // the player smoothly to the hit point (~600 ms, cubic ease-in-out). Mirrors the Babylon
+    // web viewer's [teleportTo] (viewerScene.ts). Registered in [onSceneReady]; floor clicks
+    // are routed via [attachFloorClickListener] which runs at the end of [placeObjects] once
+    // the env glb's SceneObject exists.
+    private var teleportTween: TeleportTweenSystem? = null
 
     companion object {
         private const val TAG = "MuseumSpatial"
@@ -130,6 +157,10 @@ class ImmersiveActivity : AppSystemActivity() {
         // the player at eye level — always visible, single tap toggles all ExoPlayer volumes.
         private const val MUTE_BUTTON_SIZE_M = 0.18f
 
+        // Per-source in-scene audio icon (Quest meters). 0.25 × 0.25 m disc pinned to each
+        // audio emitter's pose. Single tap mutes only that ExoPlayer (not the global bus).
+        private const val AUDIO_ICON_SIZE_M = 0.25f
+
         // Welcome / scene-picker panel (Quest meters). Larger than the info modal because it
         // hosts a scrollable list of exhibitions.
         private const val WELCOME_PANEL_WIDTH_M = 1.6f
@@ -137,11 +168,16 @@ class ImmersiveActivity : AppSystemActivity() {
     }
 
     override fun registerFeatures(): List<SpatialFeature> =
+        // Order matches StarterSample: VRFeature first (initialises the OpenXR session +
+        // panel render targets that ComposeFeature attaches to), ComposeFeature second
+        // (registers the Compose-backed panel renderer used by ComposeViewPanelRegistration),
+        // then optional features.
+        //
         // PhysicsFeature drives gravity + rigid-body collision for entities with a Physics
         // component, and (because we leave useGrabbablePhysics at its default of true) also
         // integrates with toolkit Grabbable: physics pauses while an object is grabbed and
         // resumes with the controller's release velocity, so grab→throw "just works".
-        listOf(VRFeature(this), spatialAudioFeature, ComposeFeature(), PhysicsFeature(spatial))
+        listOf(VRFeature(this), ComposeFeature(), spatialAudioFeature, PhysicsFeature(spatial))
 
     /**
      * One reusable Compose panel that hosts the info modal. The panel itself is registered
@@ -225,16 +261,61 @@ class ImmersiveActivity : AppSystemActivity() {
         // Reference space so headset tracking starts at floor level.
         scene.setReferenceSpace(ReferenceSpace.LOCAL_FLOOR)
 
-        // Basic 3-point lighting so the gallery glb is visible.
+        // Richer warm "museum at evening" lighting — warm ambient floor + a strong, slightly
+        // warm top-front sun + IBL from environment.env for glb material reflections. Matches
+        // StarterSample's setLightingEnvironment + updateIBLEnvironment + skydome pattern.
         scene.setLightingEnvironment(
-            ambientColor = Vector3(0.55f, 0.55f, 0.55f),
-            sunColor = Vector3(2.0f, 2.0f, 2.0f),
-            sunDirection = -Vector3(1.0f, 3.0f, -2.0f),
-            environmentIntensity = 0.6f,
+            ambientColor = Vector3(0.18f, 0.16f, 0.14f),
+            sunColor = Vector3(3.5f, 3.2f, 2.7f),
+            sunDirection = -Vector3(0.6f, 1.0f, -0.4f).normalize(),
+            environmentIntensity = 0.85f,
         )
+        // IBL cube map for PBR reflections on the gallery glb. Asset is copied from
+        // StarterSample's app/src/main/assets/environment.env. Wrapped in runCatching so a
+        // missing asset doesn't crash the scene — lighting still works without IBL.
+        runCatching { scene.updateIBLEnvironment("environment.env") }
+            .onFailure { Log.w(TAG, "IBL environment.env not loaded; PBR reflections disabled", it) }
+
+        // Subtle dark-night skybox so the void outside the gallery doesn't read as pure black.
+        // mesh://skybox is a built-in inward-facing cube; unlit so scene lighting can't darken it.
+        Entity.create(
+            Mesh(Uri.parse("mesh://skybox"), hittable = MeshCollision.NoCollision),
+            Material().apply {
+                unlit = true
+                baseColor = Color4(0.05f, 0.05f, 0.08f, 1f)
+            },
+            Transform(Pose()),
+        )
+
+        // Disable the SDK's built-in teleport locomotion BEFORE we register our smooth
+        // replacement. The default [LocomotionSystem] writes the view origin every time the
+        // thumbstick is released (teleport-on-release), which would fight our per-frame
+        // continuous-walk writes. Calling enableLocomotion(false) leaves the system installed
+        // but no-ops its execute() body — safer than unregisterSystem, which other samples
+        // (PremiumMediaSample) do but which removes the entity-tracking machinery the SDK
+        // uses for the controller laser cursor.
+        systemManager.findSystem<LocomotionSystem>().enableLocomotion(false)
+
+        // Register our custom smooth-walking + snap-turn replacement. The system holds its
+        // own (x, y, z, yaw) state and writes the view origin every frame the thumbsticks are
+        // held. See [SmoothLocomotionSystem] kdoc for the input model and movement math.
+        smoothLocomotion = SmoothLocomotionSystem(scene).also { systemManager.registerSystem(it) }
+
+        // Click-to-animated-move tween (~600 ms cubic ease-in-out). Floor clicks on the env
+        // glb (attached in [placeObjects] once the env entity exists) call into
+        // [TeleportTweenSystem.startTween]; the system then interpolates view origin every
+        // frame in execute(). It also calls back into [smoothLocomotion.syncFromScene] each
+        // tween frame so the locomotion system's cached origin stays aligned and the player
+        // can resume stick walking immediately after the animation ends.
+        teleportTween = TeleportTweenSystem(scene, smoothLocomotion!!).also {
+            systemManager.registerSystem(it)
+        }
 
         // Spawn the user a couple meters in front of the gallery centroid, looking forward.
         scene.setViewOrigin(0.0f, 0.0f, 0.0f, 0.0f)
+        // Keep the locomotion system's cached origin in lockstep with the SDK after every
+        // external setViewOrigin so the next stick frame increments from the correct anchor.
+        smoothLocomotion?.syncFromScene(0.0f, 0.0f, 0.0f, 0.0f)
 
         // Spawn the single reusable info-panel entity now that the scene is up. It starts
         // hidden — [showModalFor] flips Visible(true) and updates its Transform on click.
@@ -256,9 +337,12 @@ class ImmersiveActivity : AppSystemActivity() {
 
     private fun spawnInfoPanelEntity() {
         // Park the panel ~1.5 m in front of the LOCAL_FLOOR origin at eye level. Repositioned
-        // on every click so the player always sees it dead-ahead.
+        // on every click so the player always sees it dead-ahead. Quaternion(0,180,0) rotates
+        // 180° around Y so the panel's front face points back toward the player (Spatial SDK
+        // panels' default normal is +Z, which faces AWAY from a player standing at origin).
         val initialPose = Pose(
             Vector3(0f, INFO_PANEL_EYE_HEIGHT_M, -INFO_PANEL_DISTANCE_M),
+            Quaternion(0f, 180f, 0f),
         )
         infoPanelEntity = Entity.create(
             Panel(R.id.info_panel),
@@ -281,7 +365,7 @@ class ImmersiveActivity : AppSystemActivity() {
      * up via [muteButtonOnClick] into [toggleAudio].
      */
     private fun spawnMuteButtonEntity() {
-        val pose = Pose(Vector3(0.5f, 1.4f, -1.3f))
+        val pose = Pose(Vector3(0.5f, 1.4f, -1.3f), Quaternion(0f, 180f, 0f))
         Entity.create(
             Panel(R.id.mute_button),
             PanelDimensions(Vector2(MUTE_BUTTON_SIZE_M, MUTE_BUTTON_SIZE_M)),
@@ -298,7 +382,7 @@ class ImmersiveActivity : AppSystemActivity() {
      * [loadExhibition] which fans out objects into the scene.
      */
     private fun spawnWelcomePanelEntity() {
-        val pose = Pose(Vector3(0f, 1.6f, -2f))
+        val pose = Pose(Vector3(0f, 1.6f, -2f), Quaternion(0f, 180f, 0f))
         welcomePanelEntity = Entity.create(
             Panel(R.id.welcome_panel),
             PanelDimensions(Vector2(WELCOME_PANEL_WIDTH_M, WELCOME_PANEL_HEIGHT_M)),
@@ -362,13 +446,31 @@ class ImmersiveActivity : AppSystemActivity() {
                 (it.walkable || it.interaction == "none" ||
                     it.scale.maxOrNull()?.let { s -> s > 1.5f } == true)
         } ?: objects.firstOrNull { it.expand?.asset?.type == "model" }
+
+        // Hotspots = every non-env object with a visible asset type (image/video/non-env model).
+        // The centroid of these positions is "where the paintings are" in XZ and is what the
+        // player should face on spawn. See [recenterOnEnvironment].
+        val hotspots = objects.filter { obj ->
+            obj !== env && when (obj.expand?.asset?.type) {
+                "image", "video" -> true
+                "model" -> true
+                else -> false
+            }
+        }
+        val hotspotCentroid = if (hotspots.isEmpty()) null else {
+            var sx = 0f
+            var sy = 0f
+            var sz = 0f
+            for (h in hotspots) {
+                sx += h.position[0]
+                sy += h.position[1]
+                sz += h.position[2]
+            }
+            Vector3(sx / hotspots.size, sy / hotspots.size, sz / hotspots.size)
+        }
+
         if (env != null) {
-            val ex = env.position[0]
-            val ey = env.position[1]
-            val ez = env.position[2]
-            Log.i(TAG, "→ centering player on env '${env.title}' at ($ex, $ey, $ez)")
-            // Place the player at the gallery's reference height (its origin), facing +Z.
-            scene.setViewOrigin(ex, ey, ez, 0.0f)
+            recenterOnEnvironment(env, hotspots, hotspotCentroid)
         }
 
         for (obj in objects) {
@@ -397,6 +499,97 @@ class ImmersiveActivity : AppSystemActivity() {
                 Log.e(TAG, "✗ place failed for ${obj.title}", e)
             }
         }
+
+        // Attach the click-to-animated-move listener to the env glb. Must run AFTER spawnGlb has
+        // created the env entity; we locate it by Query on SupportsLocomotion (only the env has
+        // it) rather than threading the entity reference through spawnGlb's signature, which
+        // keeps spawnGlb's body unchanged. See [attachFloorClickToEnv].
+        attachFloorClickToEnv()
+    }
+
+    /**
+     * Spawn the player at the center of the gallery's hotspot cluster, on the floor, facing the
+     * densest cluster of paintings. Mirrors the web viewer's `spawnAtEnvironmentCenter` but
+     * works without reading the streamed glb's bounding box (SDK 0.12's toolkit [Mesh] doesn't
+     * surface per-mesh extents synchronously, and a future-based AABB read from the runtime
+     * [SceneObject] isn't reliably exposed in this version — the public API only guarantees
+     * mesh.materials, which is what we already use elsewhere).
+     *
+     * Strategy (mirrors viewerScene.ts:1375-1383 spawnAtEnvironmentCenter):
+     *  - center XZ: midpoint of the **hotspot** AABB on the XZ plane. Paintings hang on the
+     *    room's walls, so the XZ midpoint of their positions is reliably *inside* the room
+     *    near the floor center rather than at the glb's authoring origin (which is often a
+     *    corner of the bbox or far below the actual floor for sketchfab models).
+     *  - floor Y: env.position.y is the gallery's authored ground plane; we use that unless the
+     *    paintings hang surprisingly low, in which case we fall back to `minHotspotY - 1.6`
+     *    (head height) so the player still stands below them. With [ReferenceSpace.LOCAL_FLOOR]
+     *    set in [onSceneReady] the runtime offsets the live head pose for us, so we pass the
+     *    bare floor Y here, not floor + eye height.
+     *  - yaw: atan2(dx, dz) toward [hotspotCentroid] (in radians, converted to degrees for the
+     *    SDK overload). 0° looks down +Z; positive yaw rotates around +Y (right-handed Y-up).
+     *    This is the same yaw convention used by the toolkit's [Quaternion(0, yaw, 0)] elsewhere
+     *    in this file (e.g. info-panel/welcome-panel facing the player).
+     *
+     * If [hotspots] is empty we fall back to env's authored position (the legacy behaviour) so
+     * empty-room exhibitions don't regress. After writing the new origin we mirror it into
+     * [smoothLocomotion]'s cached anchor so the next stick frame increments from the right
+     * place — without this the player would snap back to the previous (currentX, …, yawDeg)
+     * the first time they touched the thumbstick.
+     */
+    private fun recenterOnEnvironment(
+        env: SceneObjectRecord,
+        hotspots: List<SceneObjectRecord>,
+        hotspotCentroid: Vector3?,
+    ) {
+        runCatching {
+            if (hotspots.isEmpty() || hotspotCentroid == null) {
+                val ex = env.position[0]
+                val ey = env.position[1]
+                val ez = env.position[2]
+                Log.i(TAG, "→ no hotspots; centering player on env '${env.title}' at ($ex, $ey, $ez)")
+                scene.setViewOrigin(ex, ey, ez, 0f)
+                smoothLocomotion?.syncFromScene(ex, ey, ez, 0f)
+                return@runCatching
+            }
+
+            // Hotspot AABB → midpoint = room center on XZ (paintings line the walls).
+            var minX = Float.POSITIVE_INFINITY
+            var maxX = Float.NEGATIVE_INFINITY
+            var minY = Float.POSITIVE_INFINITY
+            var minZ = Float.POSITIVE_INFINITY
+            var maxZ = Float.NEGATIVE_INFINITY
+            for (h in hotspots) {
+                minX = min(minX, h.position[0]); maxX = max(maxX, h.position[0])
+                minY = min(minY, h.position[1])
+                minZ = min(minZ, h.position[2]); maxZ = max(maxZ, h.position[2])
+            }
+            val cx = (minX + maxX) * 0.5f
+            val cz = (minZ + maxZ) * 0.5f
+
+            // Floor Y: env's authored Y is the reference floor. Use min(envY, minHotspotY-1.6)
+            // as a safety net for galleries where paintings hang well above an unusually-high
+            // env origin — 1.6 m is roughly head height so paintings at eye level (1.5 m) still
+            // leave the player on the floor below them.
+            val envY = env.position[1]
+            val floorY = min(envY, minY - 1.6f)
+
+            // Yaw to face hotspot centroid from (cx, cz). atan2(dx, dz) returns radians where
+            // 0 = look toward +Z; positive rotates toward +X (standard right-handed Y-up yaw).
+            val dx = hotspotCentroid.x - cx
+            val dz = hotspotCentroid.z - cz
+            val yawRad = atan2(dx, dz)
+            val yawDeg = (yawRad * 180.0 / PI).toFloat()
+
+            Log.i(
+                TAG,
+                "→ recenter on env '${env.title}': hotspot bbox xz=($minX..$maxX, $minZ..$maxZ) " +
+                    "→ origin=($cx, $floorY, $cz) yaw=${yawDeg}° " +
+                    "facing centroid=(${hotspotCentroid.x}, ${hotspotCentroid.y}, ${hotspotCentroid.z}) " +
+                    "(${hotspots.size} hotspots)",
+            )
+            scene.setViewOrigin(cx, floorY, cz, yawDeg)
+            smoothLocomotion?.syncFromScene(cx, floorY, cz, yawDeg)
+        }.onFailure { Log.e(TAG, "✗ recenterOnEnvironment failed; falling back to origin", it) }
     }
 
     override fun onDestroy() {
@@ -456,6 +649,64 @@ class ImmersiveActivity : AppSystemActivity() {
     }
 
     /**
+     * Find the env glb entity (the only one carrying [SupportsLocomotion]) and attach an
+     * [InputListener] that animates the player to the floor-hit point. Mirrors the Babylon web
+     * viewer's `processPickedHit` → `teleportTo` flow (viewerScene.ts:983-1130).
+     *
+     * Routing rules:
+     *  - The SDK's ray-pick chooses the nearest hittable mesh. So clicks on paintings/hotspots
+     *    fire those entities' [attachClickListener] (showModalFor / grab) and never reach the
+     *    env. Only ray-misses against hotspots — i.e. clicks on the gallery floor/walls — land
+     *    here, which matches what we want.
+     *  - We filter by hit-normal: walls and ceiling have horizontal-or-downward normals, so we
+     *    only tween if `hitInfo.normal.y > 0.5` (mostly upward → floor). This prevents the
+     *    "click a wall and faceplant" failure mode the web viewer guards against via
+     *    `isWalkableHit`.
+     *  - Tween is no-op-while-active (see [TeleportTweenSystem.startTween]) so rapid clicks
+     *    don't stack.
+     *
+     * Idempotent: if called multiple times (e.g. user picks a new exhibition), the most recent
+     * env's SceneObject just receives an additional listener. Each [TeleportTweenSystem.startTween]
+     * call early-outs while a tween is running, so duplicate listeners don't cause double-jumps.
+     */
+    private fun attachFloorClickToEnv() {
+        val sos = systemManager.findSystem<SceneObjectSystem>()
+        val envEntity = Query.where { has(SupportsLocomotion.id, Mesh.id) }.eval().firstOrNull()
+        if (envEntity == null) {
+            Log.w(TAG, "floor-click: no env entity (SupportsLocomotion+Mesh) found in scene")
+            return
+        }
+        sos.getSceneObject(envEntity)?.thenAccept { so ->
+            if (so == null) {
+                Log.w(TAG, "floor-click: env SceneObject is null")
+                return@thenAccept
+            }
+            so.addInputListener(
+                object : InputListener {
+                    override fun onClick(
+                        receiver: SceneObject,
+                        hitInfo: HitInfo,
+                        sourceOfInput: Entity,
+                    ) {
+                        // Reject clicks on walls/ceiling — only tween on floor-like surfaces.
+                        // 0.5 ≈ 60° from horizontal, generous enough to cover slight floor
+                        // tilts in artist-authored glbs while still rejecting vertical walls.
+                        val normalY = hitInfo.normal.y
+                        if (normalY <= 0.5f) {
+                            Log.i(TAG, "🖱️  env click rejected (normal.y=$normalY, treating as wall/ceiling)")
+                            return
+                        }
+                        val p = hitInfo.point
+                        Log.i(TAG, "🖱️  floor click → tween to (${p.x}, ${p.y}, ${p.z})")
+                        teleportTween?.startTween(p)
+                    }
+                },
+            )
+            Log.i(TAG, "✓ floor-click listener attached to env entity")
+        }
+    }
+
+    /**
      * Show the Compose info panel for [sourceEntity]. The panel entity itself is created once
      * (in [spawnInfoPanelEntity]); here we just update [infoPanelState] so the Compose tree
      * re-renders with the new title/description, then reposition + show the entity.
@@ -478,9 +729,10 @@ class ImmersiveActivity : AppSystemActivity() {
             visible = true,
         )
 
-        // Reposition the panel in front of the player at eye level, then make it visible.
+        // Reposition the panel in front of the player at eye level, facing them.
         val pose = Pose(
             Vector3(0f, INFO_PANEL_EYE_HEIGHT_M, -INFO_PANEL_DISTANCE_M),
+            Quaternion(0f, 180f, 0f),
         )
         infoPanelEntity?.let { panel ->
             panel.setComponent(Transform(pose))
@@ -619,29 +871,54 @@ class ImmersiveActivity : AppSystemActivity() {
     }
 
     /**
-     * Build a 4-piece gold "picture frame" around a flat plane of size [planeW] × [planeH].
-     * Mirrors the web viewer's buildFrame in viewerScene.ts (slim T=0.04 / D=0.05 profile).
+     * Build a multi-layer gold "picture frame" around a flat plane of size [planeW] × [planeH].
+     * Mirrors the web viewer's buildFrame in viewerScene.ts:
+     *   1. dark "backing" panel behind the painting (planeW × planeH × 0.01, recessed),
+     *   2. four thick outer frame bars (T=0.06 thickness, D=0.08 depth) sitting forward,
+     *   3. four thin inner trim bars (T=0.015 thickness) recessed slightly behind the outer.
      *
-     * Each side is a `mesh://box` entity with a `Box(min, max)` component giving it its
-     * dimensions. The frame children share the parent's rotation so they sit flush against
-     * the painting; their local offsets are rotated into world space by `parentPose.q`
-     * (Spatial SDK's `Quaternion * Vector3` overload — see PremiumMediaSample TouchScalableSystem).
+     * Each piece is a `mesh://box` entity with a `Box(min, max)` component giving it its
+     * dimensions; local offsets are rotated into world space by `parentPose.q` (Spatial SDK's
+     * `Quaternion * Vector3` overload — see PremiumMediaSample TouchScalableSystem) so frame
+     * pieces sit flush against rotated paintings.
      *
-     * baseColor is a warm desaturated gold; `unlit = true` avoids depending on scene lighting
-     * (which would otherwise make the frame appear muddy under low ambient).
+     * Gold colour is a bright warm tone (0.95, 0.78, 0.42) tuned to match admin's PBR look
+     * even though we're stuck with `unlit = true` (no per-pixel lighting available on toolkit
+     * Material for the box mesh in SDK 0.12 — unlit avoids depending on scene lighting which
+     * would otherwise make the frame appear muddy under low ambient).
      */
     private fun spawnGoldFrame(parentPose: Pose, parentScale: Vector3, planeW: Float, planeH: Float) {
-        val t = 0.04f          // bar thickness (cross-section, perpendicular to the plane edge)
-        val d = 0.05f          // bar depth (out of the wall)
-        val frontZ = 0.025f    // push frame slightly forward so it doesn't z-fight the quad
-        val totalW = planeW + 2f * t
+        // Outer frame profile — chunkier than the previous slim version so it reads as a real
+        // museum picture frame, matching admin's T=0.06 / D=0.08 dimensions.
+        val tOuter = 0.06f      // outer bar thickness (cross-section perpendicular to plane edge)
+        val dOuter = 0.08f      // outer bar depth (out of the wall)
+        val frontZ = 0.03f      // push outer frame slightly forward to avoid z-fighting
 
-        // Build one side at [localOffset] (frame-local: +X right, +Y up, +Z out of the wall).
-        // Box half-extents are centered on the entity's own origin; we then translate to
-        // parentPose.t + parentPose.q.rotate(localOffset) so sides sit correctly even when
+        // Inner gold trim — a thin recessed band around the painting just inside the outer frame.
+        val tInner = 0.015f
+        val dInner = 0.025f
+        // Place inner trim recessed behind the front face of the outer frame so the outer
+        // visually steps over the inner (admin's `innerZ = FRONT_Z - D/2 + innerDepth/2 + 0.001`).
+        val innerZ = frontZ - dOuter / 2f + dInner / 2f + 0.001f
+
+        // Dark backing panel sits behind the painting (admin uses inner PBR material; for the
+        // toolkit Material we draw a near-black unlit box at z=-0.012). Slightly oversized so
+        // the painting doesn't show transparent bleed at the border.
+        val backingDepth = 0.015f
+        val backingZ = -0.012f
+
+        // Total width/height across the outer frame is just used to size the top/bottom bars
+        // (which span the painting plus the corner caps of the left/right bars).
+        val totalW = planeW + 2f * tOuter
+        // Inner trim total width — same idea, for the recessed inner bars.
+        val innerW = planeW + 2f * tInner
+
+        // Build one frame piece at [localOffset] (frame-local: +X right, +Y up, +Z out of the
+        // wall). Box half-extents are centered on the entity's own origin; we then translate
+        // to parentPose.t + parentPose.q.rotate(localOffset) so sides sit correctly even when
         // the parent painting is rotated. parentScale is reapplied so the frame scales with
         // any per-object scale stored in PocketBase.
-        fun makeSide(localOffset: Vector3, sizeX: Float, sizeY: Float, sizeZ: Float) {
+        fun makeBox(localOffset: Vector3, sizeX: Float, sizeY: Float, sizeZ: Float, color: Color4) {
             val hx = sizeX * 0.5f
             val hy = sizeY * 0.5f
             val hz = sizeZ * 0.5f
@@ -651,7 +928,7 @@ class ImmersiveActivity : AppSystemActivity() {
                 Mesh(Uri.parse("mesh://box")),
                 Box(Vector3(-hx, -hy, -hz), Vector3(hx, hy, hz)),
                 Material().apply {
-                    baseColor = Color4(0.85f, 0.65f, 0.32f, 1f)
+                    baseColor = color
                     unlit = true
                 },
                 Transform(sidePose),
@@ -659,14 +936,27 @@ class ImmersiveActivity : AppSystemActivity() {
             )
         }
 
-        // top
-        makeSide(Vector3(0f, planeH / 2f + t / 2f, frontZ), totalW, t, d)
-        // bottom
-        makeSide(Vector3(0f, -planeH / 2f - t / 2f, frontZ), totalW, t, d)
-        // left
-        makeSide(Vector3(-planeW / 2f - t / 2f, 0f, frontZ), t, planeH, d)
-        // right
-        makeSide(Vector3(planeW / 2f + t / 2f, 0f, frontZ), t, planeH, d)
+        // Warm bright gold — admin's PBR (0.42, 0.32, 0.16) reads as too dull when sampled
+        // through unlit toolkit material; this tone is closer to what the admin actually paints
+        // on screen after PBR lighting brightens the gold.
+        val gold = Color4(0.95f, 0.78f, 0.42f, 1f)
+        // Near-black backing — admin uses a dark PBR (0.06, 0.05, 0.06); same here via unlit.
+        val backing = Color4(0.06f, 0.05f, 0.06f, 1f)
+
+        // (1) Backing panel — slightly larger than the painting on X/Y, thin slab on Z.
+        makeBox(Vector3(0f, 0f, backingZ), planeW + 0.005f, planeH + 0.005f, backingDepth, backing)
+
+        // (2) Outer frame — 4 thick gold bars around the painting.
+        makeBox(Vector3(0f, planeH / 2f + tOuter / 2f, frontZ), totalW, tOuter, dOuter, gold) // top
+        makeBox(Vector3(0f, -planeH / 2f - tOuter / 2f, frontZ), totalW, tOuter, dOuter, gold) // bottom
+        makeBox(Vector3(-planeW / 2f - tOuter / 2f, 0f, frontZ), tOuter, planeH, dOuter, gold) // left
+        makeBox(Vector3(planeW / 2f + tOuter / 2f, 0f, frontZ), tOuter, planeH, dOuter, gold) // right
+
+        // (3) Inner trim — 4 thin gold bars sitting just inside the outer frame and recessed.
+        makeBox(Vector3(0f, planeH / 2f + tInner / 2f, innerZ), innerW, tInner, dInner, gold) // top
+        makeBox(Vector3(0f, -planeH / 2f - tInner / 2f, innerZ), innerW, tInner, dInner, gold) // bottom
+        makeBox(Vector3(-planeW / 2f - tInner / 2f, 0f, innerZ), tInner, planeH, dInner, gold) // left
+        makeBox(Vector3(planeW / 2f + tInner / 2f, 0f, innerZ), tInner, planeH, dInner, gold) // right
     }
 
     private fun spawnVideoPlaceholder(pose: Pose, scaleVec: Vector3, title: String) {
@@ -713,6 +1003,11 @@ class ImmersiveActivity : AppSystemActivity() {
         // reads the entity's world position via Transform.
         val entity = Entity.create(Transform(pose))
 
+        // Spawn a small Compose mute-icon panel pinned to the audio source's world pose so the
+        // user can SEE where each sound is coming from and silence only that emitter. The icon
+        // uses a runtime-registered panel (one per audio source) wired to per-source mute state.
+        spawnAudioIconPanel(pose, player, title)
+
         player.addListener(
             object : Player.Listener {
                 override fun onPlaybackStateChanged(playbackState: Int) {
@@ -738,6 +1033,66 @@ class ImmersiveActivity : AppSystemActivity() {
                     Log.e(TAG, "✗ audio player error for '$title': ${error.errorCodeName}", error)
                 }
             }
+        )
+    }
+
+    /**
+     * Spawn a small per-source mute icon at [pose] (the audio emitter's world position).
+     *
+     * Each audio asset needs its own panel because the panel content (the speaker glyph) is
+     * driven by per-source state — clicking the icon toggles ONLY [player]'s volume, not the
+     * global audio bus (that's what [MuteButtonPanel] is for).
+     *
+     * Each call registers a fresh runtime [ComposeViewPanelRegistration] with a unique id
+     * (mirroring [nextVideoPanelId]'s dynamic-id pattern). The panel's Compose content reads
+     * from [audioIconMuteStates] keyed by `audioKey`, and clicks fire through
+     * [audioIconOnClick] which flips the per-source mute flag and applies it to the player.
+     */
+    private fun spawnAudioIconPanel(pose: Pose, player: ExoPlayer, title: String) {
+        val panelId = nextAudioIconPanelId++
+        val audioKey = "audio_$panelId"
+
+        // Per-source observable state + click handler. The Compose tree reads these via the
+        // top-level lookup maps in [AudioIconPanel].
+        val muteState = mutableStateOf(false).also { audioIconMuteStates[audioKey] = it }
+        audioIconOnClick[audioKey] = {
+            val nowMuted = !muteState.value
+            muteState.value = nowMuted
+            runCatching { player.volume = if (nowMuted) 0f else 1f }
+            Log.i(TAG, "🔇 per-source mute '$title' → muted=$nowMuted")
+        }
+
+        registerPanel(
+            ComposeViewPanelRegistration(
+                panelId,
+                composeViewCreator = { _, ctx ->
+                    ComposeView(ctx).apply { setContent { AudioIconPanel(audioKey) } }
+                },
+                settingsCreator = {
+                    UIPanelSettings(
+                        shape = QuadShapeOptions(width = AUDIO_ICON_SIZE_M, height = AUDIO_ICON_SIZE_M),
+                        // Transparent platform theme so only the disc/glyph drawn by Compose
+                        // is visible — without it the panel Activity window would render an
+                        // opaque white square around the icon.
+                        style = PanelStyleOptions(themeResourceId = R.style.PanelAppThemeTransparent),
+                        display = DpPerMeterDisplayOptions(),
+                    )
+                },
+            )
+        )
+
+        // Place the icon at the audio source's translation, rotated 180° around Y so the
+        // panel's front face (its default +Z normal) points back toward a player roughly at
+        // world origin. We deliberately ignore the audio source's own rotation here — audio
+        // emitters are points (not oriented surfaces), so what matters is that the icon faces
+        // the room rather than the wall behind it. Matches how [spawnInfoPanelEntity] orients
+        // the info modal.
+        val iconPose = Pose(pose.t, Quaternion(0f, 180f, 0f))
+        Entity.create(
+            Panel(panelId),
+            PanelDimensions(Vector2(AUDIO_ICON_SIZE_M, AUDIO_ICON_SIZE_M)),
+            Transform(iconPose),
+            Visible(true),
         )
     }
 
@@ -787,25 +1142,76 @@ class ImmersiveActivity : AppSystemActivity() {
             return
         }
         // Interactive hotspot model: grabbable + dynamic rigid body so it falls under gravity
-        // when released. Box collider sized from the entity's scale; density tuned so a typical
-        // 0.5 m model has perceptible-but-not-leaden mass. PIVOT_Y keeps the model upright
-        // while grabbed (matches Object3DSampleIsdk/PanelLayout.kt and PremiumMediaSample).
-        Entity.create(
-            Mesh(Uri.parse(url)),
+        // when released. Following the canonical pattern in Object3DSampleIsdk/PanelLayout.kt
+        // (lines 198–229) we pass Physics dimensions via the constructor — `Physics(...)`'s
+        // dimensions argument is in WORLD half-extents and the physics layer also multiplies
+        // by the entity's Scale. PIVOT_Y keeps the model upright while grabbed.
+        //
+        // We can't read the streamed glb's bbox here (the mesh loads async and SDK 0.12
+        // doesn't surface a per-mesh extent on the toolkit Mesh), so we use a fixed 0.4 m
+        // world half-extent (0.8 m cube). That's big enough to ray-hit easily even for tiny
+        // sculptures, small enough to feel like an object rather than a wall. Density 0.5
+        // keeps the mass perceptible-but-throwable. Restitution 0.3 = light bounce on landing.
+        //
+        // The visual Mesh is given `hittable = MeshCollision.LineTest` so the controller's
+        // selection ray actually registers Grab pointer events on the model — without this
+        // hint, streamed glb meshes can default to NoCollision until the mesh finishes
+        // loading, which would make the entity un-grabbable even though the component is set.
+        val hotspotDim = Vector3(0.4f, 0.4f, 0.4f)
+        val hotspotEntity = Entity.create(
+            Mesh(Uri.parse(url), hittable = MeshCollision.LineTest),
             Transform(pose),
             Scale(scaleVec),
             Grabbable(true, GrabbableType.PIVOT_Y),
-            Physics().apply {
-                shape = "box"
-                state = PhysicsState.DYNAMIC
-                // Half-extents in object-local units (multiplied by Scale at the physics layer).
-                // 0.25 m gives a 0.5 m cube as the default collision volume, scaled by the
-                // entity's Scale component. Tweak if hotspot models read as too big/small.
-                dimensions = Vector3(0.25f, 0.25f, 0.25f)
-                density = 0.5f
-                restitution = 0.3f
-            },
+            Physics(
+                shape = "box",
+                state = PhysicsState.DYNAMIC,
+                dimensions = hotspotDim,
+                density = 0.5f,
+                restitution = 0.3f,
+            ),
         )
-        Log.i(TAG, "🎯 hotspot glb (grabbable+dynamic-physics) '$title'")
+        // Visual locator dot so the user can find the hotspot in the room — small floating
+        // gold beacon 0.6 m above the anchor pose (see spawnHotspotMarker).
+        spawnHotspotMarker(pose, scaleVec)
+        Log.i(
+            TAG,
+            "🎯 hotspot glb '$title' id=${hotspotEntity.id} " +
+                "pos=(${pose.t.x}, ${pose.t.y}, ${pose.t.z}) " +
+                "scale=(${scaleVec.x}, ${scaleVec.y}, ${scaleVec.z}) " +
+                "physicsDim=$hotspotDim",
+        )
+    }
+
+    /**
+     * Spawn a small floating gold-coloured beacon ~0.6 m above [parentPose] so the user can
+     * find grabbable hotspot models across the gallery. Uses an unlit gold box (same warm
+     * tone as the picture frames) — `unlit = true` means it reads as a self-luminous marker
+     * even in dim ambient. Sized 0.06 m (half-extent 0.03 m) so it's visible across the room
+     * without dominating the scene.
+     *
+     * Intentionally NOT grabbable and NOT physics-enabled — this is a pure locator. We also
+     * don't parent it to the hotspot entity: if the user throws the hotspot, the marker stays
+     * at the original spawn anchor as a "this is where the object came from" indicator.
+     * `MeshCollision.NoCollision` ensures the ray-cast passes through the marker so the
+     * hotspot underneath remains grabbable.
+     */
+    private fun spawnHotspotMarker(parentPose: Pose, parentScale: Vector3) {
+        val h = 0.03f
+        // Local offset 0.6 m up; rotate by parentPose.q so a rotated parent still gets a
+        // marker directly above its top (same idiom as makeBox in spawnGoldFrame).
+        val worldOffset = parentPose.q * Vector3(0f, 0.6f, 0f)
+        val markerPose = Pose(parentPose.t + worldOffset, parentPose.q)
+        Entity.create(
+            Mesh(Uri.parse("mesh://box"), hittable = MeshCollision.NoCollision),
+            Box(Vector3(-h, -h, -h), Vector3(h, h, h)),
+            Material().apply {
+                // Warm gold matching the picture frames; unlit so it glows in low ambient.
+                baseColor = Color4(1.0f, 0.86f, 0.45f, 1f)
+                unlit = true
+            },
+            Transform(markerPose),
+            Scale(parentScale),
+        )
     }
 }

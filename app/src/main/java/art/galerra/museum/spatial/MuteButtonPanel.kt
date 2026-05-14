@@ -1,23 +1,26 @@
 package art.galerra.museum.spatial
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
+import androidx.compose.material3.Icon
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
+import com.meta.spatial.uiset.theme.SpatialTheme
+import com.meta.spatial.uiset.theme.darkSpatialColorScheme
+import com.meta.spatial.uiset.theme.icons.SpatialIcons
+import com.meta.spatial.uiset.theme.icons.regular.VolumeOff
+import com.meta.spatial.uiset.theme.icons.regular.VolumeOn
 
 /**
  * Shared state for the floating mute-toggle button. The activity flips [muteButtonState] when
@@ -29,38 +32,57 @@ val muteButtonState = mutableStateOf(false)
 /** Invoked when the user clicks the mute button. Activity wires this to `toggleAudio()`. */
 var muteButtonOnClick: () -> Unit = {}
 
-private val ButtonBackground = Color(0xCC0E0A06) // dark translucent (matches InfoPanel)
+// Translucent dark surface keeps the button visually consistent with the other museum panels.
+private val ButtonBackgroundActive = Color(0xCC0E0A06)
+private val ButtonBackgroundMuted = Color(0xCC2A0A0A) // subtle red-tinted dark when muted
 private val GoldAccent = Color(0xFFD4AF37)
+private val GoldDim = Color(0x66D4AF37)
+private val MutedAccent = Color(0xFFD47A37) // warm rust for muted state
 
 @Composable
 fun MuteButtonPanel() {
-    val muted = muteButtonState.value
+    SpatialTheme(colorScheme = darkSpatialColorScheme()) {
+        val muted = muteButtonState.value
+        val ring = if (muted) MutedAccent else GoldAccent
+        val ringSoft = if (muted) Color(0x66D47A37) else GoldDim
+        val surface = if (muted) ButtonBackgroundMuted else ButtonBackgroundActive
 
-    Surface(
-        modifier = Modifier.fillMaxSize(),
-        color = Color.Transparent,
-    ) {
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(8.dp),
+                .padding(6.dp),
             contentAlignment = Alignment.Center,
         ) {
+            // Outer faint glow ring.
             Box(
                 modifier = Modifier
                     .fillMaxSize()
                     .clip(CircleShape)
-                    .background(ButtonBackground)
-                    .clickable { muteButtonOnClick() },
+                    .border(2.dp, ringSoft, CircleShape)
+                    .padding(4.dp),
                 contentAlignment = Alignment.Center,
             ) {
-                Text(
-                    text = if (muted) "🔇" else "🔊", // 🔇 / 🔊
-                    color = GoldAccent,
-                    fontFamily = FontFamily.Default,
-                    fontWeight = FontWeight.SemiBold,
-                    fontSize = 64.sp,
-                )
+                // Inner circle: clickable surface with a bolder gold ring.
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .clip(CircleShape)
+                        .background(surface)
+                        .border(2.dp, ring, CircleShape)
+                        .clickable { muteButtonOnClick() },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        imageVector = if (muted) {
+                            SpatialIcons.Regular.VolumeOff
+                        } else {
+                            SpatialIcons.Regular.VolumeOn
+                        },
+                        contentDescription = if (muted) "Unmute audio" else "Mute audio",
+                        tint = ring,
+                        modifier = Modifier.size(56.dp),
+                    )
+                }
             }
         }
     }

@@ -3,4 +3,9 @@
     <item name="info_panel" type="id" />
     <item name="mute_button" type="id" />
     <item name="welcome_panel" type="id" />
+    <!-- Generic id slot for in-scene per-audio mute icons. Each audio source spawns its own
+         small Compose panel pinned to the audio emitter's pose; dynamic per-instance panel ids
+         (>=2_000_000) are registered at runtime, mirroring the nextVideoPanelId pattern. This
+         compile-time id is the registration "type" used as the base for the dynamic ids. -->
+    <item name="audio_icon" type="id" />
 </resources>
