@@ -170,8 +170,8 @@ class ImmersiveActivity : AppSystemActivity() {
 
         // Welcome / scene-picker panel (Quest meters). Larger than the info modal because it
         // hosts a scrollable list of exhibitions.
-        private const val WELCOME_PANEL_WIDTH_M = 1.6f
-        private const val WELCOME_PANEL_HEIGHT_M = 1.4f
+        private const val WELCOME_PANEL_WIDTH_M = 1.0f
+        private const val WELCOME_PANEL_HEIGHT_M = 0.7f
     }
 
     override fun registerFeatures(): List<SpatialFeature> =
@@ -339,8 +339,9 @@ class ImmersiveActivity : AppSystemActivity() {
         // [spawnWelcomePanelEntity] so getPanelEntity()'s lambda returns a real Entity. The
         // system queries [welcomeState.visible] each frame and early-outs when the panel is
         // hidden, so we don't need to unregister it after scene pick.
-        welcomePanelFollow = WelcomePanelFollowSystem(scene) { welcomePanelEntity }
-            .also { systemManager.registerSystem(it) }
+        // Disabled — testing if static spawn matches mute button success.
+        // welcomePanelFollow = WelcomePanelFollowSystem(scene) { welcomePanelEntity }
+        //     .also { it.start() }
 
         // If exhibition already loaded before the scene was ready, place objects now.
         pendingObjects?.let {
@@ -411,7 +412,7 @@ class ImmersiveActivity : AppSystemActivity() {
         // Placeholder pose — the follow system writes the real Transform on frame 1 from the
         // live head pose. We use a safe Y so even if the follow tick is somehow delayed the
         // panel still spawns at eye level rather than buried in the floor.
-        val pose = Pose(Vector3(0f, 1.6f, 0f), Quaternion())
+        val pose = Pose(Vector3(0f, 1.4f, -1.3f), Quaternion(0f, 180f, 0f))
         welcomePanelEntity = Entity.create(
             Panel(R.id.welcome_panel),
             PanelDimensions(Vector2(WELCOME_PANEL_WIDTH_M, WELCOME_PANEL_HEIGHT_M)),
@@ -595,12 +596,11 @@ class ImmersiveActivity : AppSystemActivity() {
             val cx = (minX + maxX) * 0.5f
             val cz = (minZ + maxZ) * 0.5f
 
-            // Floor Y: env's authored Y is the reference floor. Use min(envY, minHotspotY-1.6)
-            // as a safety net for galleries where paintings hang well above an unusually-high
-            // env origin — 1.6 m is roughly head height so paintings at eye level (1.5 m) still
-            // leave the player on the floor below them.
-            val envY = env.position[1]
-            val floorY = min(envY, minY - 1.6f)
+            // Floor Y: env's authored Y is the reference floor. The glb's local origin is
+            // assumed to be at the floor — so setting view-origin Y = envY puts the player
+            // standing on the gallery floor. The previous min(envY, minY-1.6) heuristic put
+            // the player below the floor when paintings hung at eye level.
+            val floorY = env.position[1]
 
             // Yaw to face hotspot centroid from (cx, cz). atan2(dx, dz) returns radians where
             // 0 = look toward +Z; positive rotates toward +X (standard right-handed Y-up yaw).
