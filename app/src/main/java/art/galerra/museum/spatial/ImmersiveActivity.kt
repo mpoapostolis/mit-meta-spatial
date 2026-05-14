@@ -143,6 +143,13 @@ class ImmersiveActivity : AppSystemActivity() {
     // the env glb's SceneObject exists.
     private var teleportTween: TeleportTweenSystem? = null
 
+    // Per-frame system that keeps the welcome / scene-picker panel in front of the live head
+    // pose so the player always sees it, regardless of how the Quest was oriented at boot. The
+    // system early-outs when `welcomeState.visible == false`, so once the user picks a scene
+    // the panel stops following (and is also Visible(false) at that point). See
+    // [WelcomePanelFollowSystem] for the math.
+    private var welcomePanelFollow: WelcomePanelFollowSystem? = null
+
     companion object {
         private const val TAG = "MuseumSpatial"
         private const val DEFAULT_EXHIBITION_ID = "ah1bngq5143ujhw"
@@ -328,6 +335,13 @@ class ImmersiveActivity : AppSystemActivity() {
         // must pick a scene before any exhibition objects are loaded — see [welcomeOnPick].
         spawnWelcomePanelEntity()
 
+        // Register the per-frame head-follow updater for the welcome panel. Must run AFTER
+        // [spawnWelcomePanelEntity] so getPanelEntity()'s lambda returns a real Entity. The
+        // system queries [welcomeState.visible] each frame and early-outs when the panel is
+        // hidden, so we don't need to unregister it after scene pick.
+        welcomePanelFollow = WelcomePanelFollowSystem(scene) { welcomePanelEntity }
+            .also { systemManager.registerSystem(it) }
+
         // If exhibition already loaded before the scene was ready, place objects now.
         pendingObjects?.let {
             placeObjects(it)
@@ -375,14 +389,29 @@ class ImmersiveActivity : AppSystemActivity() {
     }
 
     /**
-     * Spawn the welcome panel ~2 m in front of the player at eye level. Visible from launch.
+     * Spawn the welcome panel and let [WelcomePanelFollowSystem] place it in front of the
+     * live head pose every frame. We seed Transform with a sentinel near-origin pose; the
+     * follow system overwrites it on its first execute() so the player never sees this seed.
+     * Using a *hidden* placeholder until the follow runs is also viable, but Visible(true) is
+     * what the compose panel registration expects on creation and the first follow-system tick
+     * happens before the next render frame in practice.
+     *
+     * Why no fixed `Pose(0, 1.6, -2)` here anymore: that pose is in LOCAL_FLOOR space (z=-2 in
+     * front of the spawn origin), but the player's actual head facing direction at boot
+     * depends on where the Quest was when the OS handed us the session — so the fixed pose
+     * frequently ends up behind the player. See [WelcomePanelFollowSystem] for the per-frame
+     * head-relative placement that replaces it.
+     *
      * Kicks off [PocketBaseClient.loadScenes] in the background and populates [welcomeState] so
      * the Compose tree re-renders with the list of scenes. The button taps inside the panel
      * route through [welcomeOnPick]: set the picked id, hide the panel, then trigger
      * [loadExhibition] which fans out objects into the scene.
      */
     private fun spawnWelcomePanelEntity() {
-        val pose = Pose(Vector3(0f, 1.6f, -2f), Quaternion(0f, 180f, 0f))
+        // Placeholder pose — the follow system writes the real Transform on frame 1 from the
+        // live head pose. We use a safe Y so even if the follow tick is somehow delayed the
+        // panel still spawns at eye level rather than buried in the floor.
+        val pose = Pose(Vector3(0f, 1.6f, 0f), Quaternion())
         welcomePanelEntity = Entity.create(
             Panel(R.id.welcome_panel),
             PanelDimensions(Vector2(WELCOME_PANEL_WIDTH_M, WELCOME_PANEL_HEIGHT_M)),
@@ -901,11 +930,15 @@ class ImmersiveActivity : AppSystemActivity() {
         // visually steps over the inner (admin's `innerZ = FRONT_Z - D/2 + innerDepth/2 + 0.001`).
         val innerZ = frontZ - dOuter / 2f + dInner / 2f + 0.001f
 
-        // Dark backing panel sits behind the painting (admin uses inner PBR material; for the
-        // toolkit Material we draw a near-black unlit box at z=-0.012). Slightly oversized so
-        // the painting doesn't show transparent bleed at the border.
+        // Dark backing panel sits behind the painting. Earlier revisions had this at z=-0.012
+        // with depth 0.015 — that put the backing slab spanning z=[-0.0195, -0.0045], which
+        // overlaps the painting (Quad at z=0) badly enough to occlude / z-fight the painting
+        // texture from one viewing side (Quad in SDK 0.12 is single-sided; the backing slab
+        // is two-sided box geometry). Push the backing fully behind the painting plane: now
+        // spans z=[-0.0575, -0.0425], leaving a clean ~0.04 m gap so the painting's albedo
+        // texture renders unobstructed regardless of approach angle.
         val backingDepth = 0.015f
-        val backingZ = -0.012f
+        val backingZ = -0.05f
 
         // Total width/height across the outer frame is just used to size the top/bottom bars
         // (which span the painting plus the corner caps of the left/right bars).

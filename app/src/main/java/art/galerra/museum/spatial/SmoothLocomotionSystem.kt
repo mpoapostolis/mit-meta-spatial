@@ -170,26 +170,49 @@ class SmoothLocomotionSystem(private val scene: Scene) : SystemBase() {
     }
 
     /**
-     * Extract the head's yaw (rotation around world Y) in radians. The head's Transform.q is a
-     * quaternion; we project the forward direction onto the XZ plane and atan2 it. Returning 0
-     * if the head entity isn't found yet (very-early-frame race) is safe — locomotion just
-     * defaults to world-axis-aligned walking until the head comes online.
+     * Extract the head's yaw (rotation around world Y) in radians. We pull the head's world
+     * forward vector, **ZERO the Y component**, then atan2 it — so the locomotion direction
+     * is always ground-locked regardless of where the head is pitched. Without this, looking
+     * up at a painting and pressing forward would walk the player into the ceiling (the raw
+     * forward vector has fwd.y ≈ 1 when looking straight up; the resulting motion vector
+     * after rotation tilts upward, and currentY drifts).
+     *
+     * Path-order: ground-project → length-guard → atan2. The length-guard catches the edge
+     * case where the player is looking nearly straight up/down (flatLen ≈ 0); returning the
+     * cached previous yaw via the [lastValidYawRad] memo prevents the player's walking
+     * direction from spinning when they tilt their head extreme angles.
+     *
+     * Returning 0 if the head entity isn't found yet (very-early-frame race) is safe — the
+     * cached state isn't seeded yet either, and locomotion defaults to world-axis-aligned
+     * walking until the head comes online.
      */
+    private var lastValidYawRad: Float = 0f
     private fun getHeadYawRad(): Float {
         val head =
             Query.where { has(AvatarAttachment.id) }
                 .filter { isLocal() and by(AvatarAttachment.typeData).isEqualTo("head") }
                 .eval()
                 .firstOrNull()
-                ?: return 0f
-        val transform = head.tryGetComponent<Transform>() ?: return 0f
+                ?: return lastValidYawRad
+        val transform = head.tryGetComponent<Transform>() ?: return lastValidYawRad
         // Pose.forward() returns the world-space forward vector implied by the pose's
-        // quaternion. Projecting onto XZ and taking atan2 gives us yaw in radians.
+        // quaternion. Project onto XZ by zeroing Y, then normalize — this is the canonical
+        // pattern from the SDK samples (meta_spatial_scanner CuratedObjectHandler.kt:222):
+        //   `(headTransform.forward() * Vector3(1f, 0f, 1f)).normalize()`
+        // We do it explicitly here so a flat == 0 vector (player looking straight up/down)
+        // doesn't divide-by-zero — we fall back to the last valid yaw instead.
         val fwd = transform.transform.forward()
+        val flatX = fwd.x
+        val flatZ = fwd.z
+        val flatLen = sqrt(flatX * flatX + flatZ * flatZ)
+        if (flatLen < 1e-4f) return lastValidYawRad
         // atan2(x, -z) yields yaw such that 0° = forward along -Z, +90° = forward along +X,
         // matching the convention used by Scene.setViewOrigin's `degRotation` parameter
-        // (rotation about Y, 0° = facing -Z).
-        return atan2(fwd.x, -fwd.z)
+        // (rotation about Y, 0° = facing -Z). Using the unnormalised flat components is fine
+        // — atan2 is scale-invariant in its inputs.
+        val yaw = atan2(flatX, -flatZ)
+        lastValidYawRad = yaw
+        return yaw
     }
 
     /** Wrap a yaw value into the canonical [-180°, 180°] range so it doesn't drift unbounded. */
