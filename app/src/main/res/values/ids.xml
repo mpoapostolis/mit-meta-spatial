@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <item name="info_panel" type="id" />
+    <item name="mute_button" type="id" />
+    <item name="welcome_panel" type="id" />
+</resources>
