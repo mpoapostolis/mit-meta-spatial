@@ -301,11 +301,8 @@ class ImmersiveActivity : AppSystemActivity() {
         // but no-ops its execute() body — safer than unregisterSystem, which other samples
         // (PremiumMediaSample) do but which removes the entity-tracking machinery the SDK
         // uses for the controller laser cursor.
+        // Disable default teleport-on-release. Replace with smooth walk + smooth tween-on-click.
         systemManager.findSystem<LocomotionSystem>().enableLocomotion(false)
-
-        // Register our custom smooth-walking + snap-turn replacement. The system holds its
-        // own (x, y, z, yaw) state and writes the view origin every frame the thumbsticks are
-        // held. See [SmoothLocomotionSystem] kdoc for the input model and movement math.
         smoothLocomotion = SmoothLocomotionSystem(scene).also { systemManager.registerSystem(it) }
 
         // Click-to-animated-move tween (~600 ms cubic ease-in-out). Floor clicks on the env
@@ -976,20 +973,15 @@ class ImmersiveActivity : AppSystemActivity() {
         // Near-black backing — admin uses a dark PBR (0.06, 0.05, 0.06); same here via unlit.
         val backing = Color4(0.06f, 0.05f, 0.06f, 1f)
 
-        // (1) Backing panel — slightly larger than the painting on X/Y, thin slab on Z.
-        makeBox(Vector3(0f, 0f, backingZ), planeW + 0.005f, planeH + 0.005f, backingDepth, backing)
-
-        // (2) Outer frame — 4 thick gold bars around the painting.
-        makeBox(Vector3(0f, planeH / 2f + tOuter / 2f, frontZ), totalW, tOuter, dOuter, gold) // top
-        makeBox(Vector3(0f, -planeH / 2f - tOuter / 2f, frontZ), totalW, tOuter, dOuter, gold) // bottom
-        makeBox(Vector3(-planeW / 2f - tOuter / 2f, 0f, frontZ), tOuter, planeH, dOuter, gold) // left
-        makeBox(Vector3(planeW / 2f + tOuter / 2f, 0f, frontZ), tOuter, planeH, dOuter, gold) // right
-
-        // (3) Inner trim — 4 thin gold bars sitting just inside the outer frame and recessed.
-        makeBox(Vector3(0f, planeH / 2f + tInner / 2f, innerZ), innerW, tInner, dInner, gold) // top
-        makeBox(Vector3(0f, -planeH / 2f - tInner / 2f, innerZ), innerW, tInner, dInner, gold) // bottom
-        makeBox(Vector3(-planeW / 2f - tInner / 2f, 0f, innerZ), tInner, planeH, dInner, gold) // left
-        makeBox(Vector3(planeW / 2f + tInner / 2f, 0f, innerZ), tInner, planeH, dInner, gold) // right
+        // Simple slim gold frame — 4 thin bars around the painting, BEHIND it so the texture
+        // stays visible. (Frame at z = -0.005, painting plane at z = 0.) No backing slab.
+        val behindZ = -0.005f
+        val tThin = 0.025f // 2.5 cm slim profile
+        val dThin = 0.02f  // 2 cm depth
+        makeBox(Vector3(0f, planeH / 2f + tThin / 2f, behindZ), planeW + tThin * 2f, tThin, dThin, gold) // top
+        makeBox(Vector3(0f, -planeH / 2f - tThin / 2f, behindZ), planeW + tThin * 2f, tThin, dThin, gold) // bottom
+        makeBox(Vector3(-planeW / 2f - tThin / 2f, 0f, behindZ), tThin, planeH, dThin, gold) // left
+        makeBox(Vector3(planeW / 2f + tThin / 2f, 0f, behindZ), tThin, planeH, dThin, gold) // right
     }
 
     private fun spawnVideoPlaceholder(pose: Pose, scaleVec: Vector3, title: String) {
