@@ -8,23 +8,21 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import com.meta.spatial.uiset.theme.SpatialTheme
-import com.meta.spatial.uiset.theme.darkSpatialColorScheme
-import com.meta.spatial.uiset.theme.icons.SpatialIcons
-import com.meta.spatial.uiset.theme.icons.regular.VolumeOff
-import com.meta.spatial.uiset.theme.icons.regular.VolumeOn
+import androidx.compose.ui.unit.sp
 
 /**
  * Shared state for the floating mute-toggle button. The activity flips [muteButtonState] when
- * audio is muted/unmuted; the Compose tree below observes it and re-renders the speaker glyph.
+ * audio is muted/unmuted; the Compose tree observes it and re-renders the speaker glyph.
  * Click bubbles up through [muteButtonOnClick] which the activity wires to `toggleAudio()`.
  */
 val muteButtonState = mutableStateOf(false)
@@ -39,14 +37,19 @@ private val GoldAccent = Color(0xFFD4AF37)
 private val GoldDim = Color(0x66D4AF37)
 private val MutedAccent = Color(0xFFD47A37) // warm rust for muted state
 
+/**
+ * Plain Material3 — same simplification as InfoPanel.kt. The uiset Icon/VolumeOn glyph has
+ * been replaced with a literal "ON" / "MUTED" text label since icon rendering inside a tiny
+ * (0.18 m) Compose panel often fails to find the vector asset at runtime on Quest.
+ */
 @Composable
 fun MuteButtonPanel() {
-    SpatialTheme(colorScheme = darkSpatialColorScheme()) {
-        val muted = muteButtonState.value
-        val ring = if (muted) MutedAccent else GoldAccent
-        val ringSoft = if (muted) Color(0x66D47A37) else GoldDim
-        val surface = if (muted) ButtonBackgroundMuted else ButtonBackgroundActive
+    val muted = muteButtonState.value
+    val ring = if (muted) MutedAccent else GoldAccent
+    val ringSoft = if (muted) Color(0x66D47A37) else GoldDim
+    val surface = if (muted) ButtonBackgroundMuted else ButtonBackgroundActive
 
+    MaterialTheme {
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -62,7 +65,6 @@ fun MuteButtonPanel() {
                     .padding(4.dp),
                 contentAlignment = Alignment.Center,
             ) {
-                // Inner circle: clickable surface with a bolder gold ring.
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
@@ -72,15 +74,11 @@ fun MuteButtonPanel() {
                         .clickable { muteButtonOnClick() },
                     contentAlignment = Alignment.Center,
                 ) {
-                    Icon(
-                        imageVector = if (muted) {
-                            SpatialIcons.Regular.VolumeOff
-                        } else {
-                            SpatialIcons.Regular.VolumeOn
-                        },
-                        contentDescription = if (muted) "Unmute audio" else "Mute audio",
-                        tint = ring,
-                        modifier = Modifier.size(56.dp),
+                    Text(
+                        text = if (muted) "MUTED" else "ON",
+                        color = ring,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 14.sp,
                     )
                 }
             }

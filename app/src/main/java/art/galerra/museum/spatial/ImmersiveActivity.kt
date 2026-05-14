@@ -35,6 +35,7 @@ import com.meta.spatial.spatialaudio.AudioSessionId
 import com.meta.spatial.spatialaudio.AudioType
 import com.meta.spatial.spatialaudio.SpatialAudioFeature
 import com.meta.spatial.toolkit.AppSystemActivity
+import com.meta.spatial.toolkit.AvatarAttachment
 import com.meta.spatial.toolkit.Box
 import com.meta.spatial.toolkit.DpPerMeterDisplayOptions
 import com.meta.spatial.toolkit.Grabbable
@@ -154,10 +155,13 @@ class ImmersiveActivity : AppSystemActivity() {
         private const val TAG = "MuseumSpatial"
         private const val DEFAULT_EXHIBITION_ID = "ah1bngq5143ujhw"
 
-        // Info panel dimensions (Quest meters) — large enough to read a paragraph at ~1.5 m.
-        private const val INFO_PANEL_WIDTH_M = 1.4f
-        private const val INFO_PANEL_HEIGHT_M = 0.9f
-        private const val INFO_PANEL_DISTANCE_M = 1.5f
+        // Info panel dimensions (Quest meters). Empirically on this device, Compose-backed panels
+        // above ~1.0 × 0.7 m occasionally fail to produce a render target — likely related to the
+        // underlying Activity-window surface allocation in 0.12. Match the welcome panel size
+        // (which renders reliably) for consistency.
+        private const val INFO_PANEL_WIDTH_M = 1.0f
+        private const val INFO_PANEL_HEIGHT_M = 0.7f
+        private const val INFO_PANEL_DISTANCE_M = 1.2f
         private const val INFO_PANEL_EYE_HEIGHT_M = 1.55f
 
         // Floating mute-button (Quest meters). Small circular panel, parked slightly right of
@@ -268,14 +272,18 @@ class ImmersiveActivity : AppSystemActivity() {
         // Reference space so headset tracking starts at floor level.
         scene.setReferenceSpace(ReferenceSpace.LOCAL_FLOOR)
 
-        // Richer warm "museum at evening" lighting — warm ambient floor + a strong, slightly
-        // warm top-front sun + IBL from environment.env for glb material reflections. Matches
-        // StarterSample's setLightingEnvironment + updateIBLEnvironment + skydome pattern.
+        // Warm "museum at evening" lighting — moderate ambient + warm sun + IBL.
+        //
+        // 0.12 NOTE: even with `unlit = true` on a toolkit Material, the runtime still routes
+        // the final RGB through HDR tonemapping. With sun = 3.5 (HDR-bright) the per-channel
+        // accumulated value on overlapping geometry can clip toward white, which is what was
+        // making the gold picture frames read as bleached white. We drop sun to ~1.5 and
+        // environmentIntensity to 0.35 — still legible, no clipping on the gold accent.
         scene.setLightingEnvironment(
-            ambientColor = Vector3(0.18f, 0.16f, 0.14f),
-            sunColor = Vector3(3.5f, 3.2f, 2.7f),
+            ambientColor = Vector3(0.22f, 0.20f, 0.16f),
+            sunColor = Vector3(1.5f, 1.35f, 1.1f),
             sunDirection = -Vector3(0.6f, 1.0f, -0.4f).normalize(),
-            environmentIntensity = 0.85f,
+            environmentIntensity = 0.35f,
         )
         // IBL cube map for PBR reflections on the gallery glb. Asset is copied from
         // StarterSample's app/src/main/assets/environment.env. Wrapped in runCatching so a
@@ -362,11 +370,13 @@ class ImmersiveActivity : AppSystemActivity() {
             Transform(initialPose),
             Visible(false),
         )
-        // The Close button in InfoPanel.kt calls this; hide the entity and clear state.
+        // The Close button in InfoPanel.kt calls this; hide the entity and clear state. Also
+        // restore any video plane that was enlarged for the "big preview" mode.
         infoPanelOnDismiss = {
-            Log.i(TAG, "🖱️  info panel dismissed")
+            Log.i(TAG, "info panel dismissed")
             infoPanelState.value = infoPanelState.value.copy(visible = false)
             infoPanelEntity?.setComponent(Visible(false))
+            previewedVideoEntity?.let { restoreVideoOriginal(it) }
         }
     }
 
@@ -511,7 +521,7 @@ class ImmersiveActivity : AppSystemActivity() {
                 val scaleVec = Vector3(obj.scale[0], obj.scale[1], obj.scale[2])
                 when (asset.type) {
                     "image" -> spawnImage(asset, pose, scaleVec, obj.title, obj)
-                    "video" -> spawnVideo(asset, pose, scaleVec, obj.title)
+                    "video" -> spawnVideo(asset, pose, scaleVec, obj.title, obj)
                     // The environment glb (gallery room) gets a STATIC physics collider so other
                     // objects collide with its floor/walls; non-environment models become DYNAMIC
                     // grabbable rigid bodies (see [spawnGlb]). We use referential equality against
@@ -638,6 +648,17 @@ class ImmersiveActivity : AppSystemActivity() {
     // Cache bitmaps keyed by entity so the modal can reuse without re-downloading.
     private val entityBitmaps = mutableMapOf<Entity, android.graphics.Bitmap>()
     private val entityRecords = mutableMapOf<Entity, SceneObjectRecord>()
+    // Track what kind of asset an entity represents so [showModalFor] can branch on
+    // "video" → reposition + enlarge the video plane in front of the player, vs
+    // "image" / "model" / "audio" → standard info-only modal. Populated in each spawnX.
+    private val entityKinds = mutableMapOf<Entity, String>()
+    // Original pose + scale for video planes — captured in spawnVideo so we can restore them
+    // after the user closes the "big preview" view that [showModalFor] swaps in on click.
+    private data class VideoOriginal(val pose: Pose, val scale: Vector3)
+    private val videoOriginals = mutableMapOf<Entity, VideoOriginal>()
+    // The single video plane currently being shown in "big preview" mode (or null). Used by
+    // the close button to know what to restore. Only one video can be previewed at a time.
+    private var previewedVideoEntity: Entity? = null
 
     private fun spawnImage(asset: AssetRecord, pose: Pose, scaleVec: Vector3, title: String, record: SceneObjectRecord) {
         // baseColor stays white so the runtime albedo texture (set later via
@@ -649,11 +670,13 @@ class ImmersiveActivity : AppSystemActivity() {
             Material().apply {
                 unlit = true
                 baseColor = Color4(1.0f, 1.0f, 1.0f, 1.0f) // white tint so the bitmap renders as-is
+                alphaMode = 0
             },
             Transform(pose),
             Scale(scaleVec),
         )
         entityRecords[entity] = record
+        entityKinds[entity] = "image"
         val url = PocketBaseClient.fileUrl(asset, asset.file, thumb = "1280x1280")
         loadImageTexture(entity, url, title)
         attachClickListener(entity, title)
@@ -662,15 +685,25 @@ class ImmersiveActivity : AppSystemActivity() {
 
     private fun attachClickListener(entity: Entity, title: String) {
         val sos = systemManager.findSystem<SceneObjectSystem>()
-        sos.getSceneObject(entity)?.thenAccept { so ->
-            so?.addInputListener(
+        val future = sos.getSceneObject(entity)
+        if (future == null) {
+            Log.w(TAG, "attachClickListener: no SceneObject future for '$title' (entity=${entity.id})")
+            return
+        }
+        future.thenAccept { so ->
+            if (so == null) {
+                Log.w(TAG, "attachClickListener: SceneObject null for '$title' (entity=${entity.id})")
+                return@thenAccept
+            }
+            so.addInputListener(
                 object : InputListener {
                     override fun onClick(receiver: SceneObject, hitInfo: HitInfo, sourceOfInput: Entity) {
-                        Log.i(TAG, "🖱️  click on '$title'")
+                        Log.i(TAG, "click on '$title' (entity=${entity.id}, kind=${entityKinds[entity]})")
                         showModalFor(entity)
                     }
                 },
             )
+            Log.i(TAG, "click listener attached to '$title' (entity=${entity.id})")
         }
     }
 
@@ -733,39 +766,139 @@ class ImmersiveActivity : AppSystemActivity() {
     }
 
     /**
+     * Compute a "1.2 m in front of the live head, eye level, facing back at the user" pose so
+     * panels and previews always spawn where the user is actually looking. Falls back to a
+     * sane LOCAL_FLOOR pose (0, 1.55, -1.2) if the head pose isn't ready yet.
+     *
+     * Returns a Pair of (placementPose, headPosition). Caller uses placementPose for Transform
+     * and may use headPosition to bias other entities.
+     */
+    private fun headRelativePose(distance: Float): Pair<Pose, Vector3> {
+        val avatars = Query.where { has(AvatarAttachment.id) }.eval().toList()
+        val head = avatars.firstOrNull { it.tryGetComponent<AvatarAttachment>()?.type == "head" }
+        val rawHeadPose = head?.tryGetComponent<Transform>()?.transform ?: scene.getViewerPose()
+        val headPose = if (rawHeadPose == Pose()) {
+            // Tracking not yet warmed up; place dead-ahead at standard eye height.
+            return Pose(
+                Vector3(0f, INFO_PANEL_EYE_HEIGHT_M, -distance),
+                Quaternion(0f, 180f, 0f),
+            ) to Vector3(0f, INFO_PANEL_EYE_HEIGHT_M, 0f)
+        } else rawHeadPose
+
+        val fwd = headPose.q * Vector3(0f, 0f, -1f)
+        val flatLenSq = fwd.x * fwd.x + fwd.z * fwd.z
+        if (flatLenSq < 1e-6f) {
+            // Looking straight up/down — degenerate; fallback to -Z.
+            return Pose(
+                Vector3(headPose.t.x, headPose.t.y, headPose.t.z - distance),
+                Quaternion(0f, 180f, 0f),
+            ) to headPose.t
+        }
+        val flatLen = kotlin.math.sqrt(flatLenSq)
+        val fx = fwd.x / flatLen
+        val fz = fwd.z / flatLen
+        val placePos = Vector3(
+            headPose.t.x + fx * distance,
+            headPose.t.y,
+            headPose.t.z + fz * distance,
+        )
+        val toHead = Vector3(headPose.t.x - placePos.x, 0f, headPose.t.z - placePos.z)
+        val rot = Quaternion.lookRotationAroundY(toHead)
+        return Pose(placePos, rot) to headPose.t
+    }
+
+    /**
      * Show the Compose info panel for [sourceEntity]. The panel entity itself is created once
      * (in [spawnInfoPanelEntity]); here we just update [infoPanelState] so the Compose tree
      * re-renders with the new title/description, then reposition + show the entity.
      *
-     * The 3D pose is fixed relative to the LOCAL_FLOOR reference space — ~1.5 m forward at
-     * eye height. (Following the panel to the live head pose would need a per-frame system;
-     * the user can also turn toward it.)
+     * Special-cases video assets: instead of just showing the metadata, the video plane itself
+     * is moved to a large "preview" pose 1.5 m in front of the player at 2× scale so the user
+     * can watch the video full-size. The info panel is then placed BELOW the video showing
+     * title/description and a close button.
+     *
+     * Close (via [infoPanelOnDismiss]) restores the video plane's original pose + scale.
      */
     private fun showModalFor(sourceEntity: Entity) {
+        Log.i(TAG, "showModalFor invoked for entity=${sourceEntity.id}")
         val record = entityRecords[sourceEntity]
         if (record == null) {
-            Log.w(TAG, "info panel: no record for entity (was it spawned via spawnImage?)")
+            Log.w(TAG, "info panel: no record for entity ${sourceEntity.id} (kinds=${entityKinds[sourceEntity]})")
+            return
+        }
+        val kind = entityKinds[sourceEntity] ?: ""
+        Log.i(TAG, "  kind='$kind' title='${record.title}'")
+
+        // Restore any previously-previewed video before swapping in a new modal.
+        previewedVideoEntity?.let { prev ->
+            if (prev != sourceEntity) restoreVideoOriginal(prev)
+        }
+
+        if (kind == "video") {
+            // BIG VIDEO PREVIEW: lift the video plane to a large pose 1.5 m in front of the user
+            // and scale it up so they can watch. The info panel sits below as a caption strip.
+            val (videoPose, headPos) = headRelativePose(1.6f)
+            // Bias the video pose upward to keep its centre near eye level when scaled up.
+            val biasedVideoPose = Pose(
+                Vector3(videoPose.t.x, headPos.y + 0.1f, videoPose.t.z),
+                videoPose.q,
+            )
+            val previewScale = Vector3(1.6f, 1.6f, 1.6f) // 1.6× the original on each axis
+            sourceEntity.setComponent(Transform(biasedVideoPose))
+            sourceEntity.setComponent(Scale(previewScale))
+            previewedVideoEntity = sourceEntity
+            Log.i(TAG, "  video preview moved to (${biasedVideoPose.t.x}, ${biasedVideoPose.t.y}, ${biasedVideoPose.t.z})")
+
+            // Caption panel below the video. Move the info panel ~0.55 m below the video centre.
+            val captionPos = Vector3(biasedVideoPose.t.x, headPos.y - 0.5f, biasedVideoPose.t.z)
+            val captionPose = Pose(captionPos, biasedVideoPose.q)
+            infoPanelState.value = InfoPanelState(
+                title = record.title,
+                description = record.description,
+                visible = true,
+                imageBitmap = null,
+                kind = "video",
+            )
+            infoPanelEntity?.let { panel ->
+                panel.setComponent(Transform(captionPose))
+                panel.setComponent(Visible(true))
+                Log.i(TAG, "  info caption set Visible(true) at ${captionPose.t.x}, ${captionPose.t.y}, ${captionPose.t.z}")
+            } ?: Log.w(TAG, "info panel entity null — onSceneReady not done?")
             return
         }
 
-        // Update Compose state — this is what the panel actually renders.
+        // Standard info modal (image / model / audio) — head-relative placement so the user
+        // never has to turn around to read the description.
+        val (modalPose, _) = headRelativePose(INFO_PANEL_DISTANCE_M)
         infoPanelState.value = InfoPanelState(
             title = record.title,
             description = record.description,
             visible = true,
-        )
-
-        // Reposition the panel in front of the player at eye level, facing them.
-        val pose = Pose(
-            Vector3(0f, INFO_PANEL_EYE_HEIGHT_M, -INFO_PANEL_DISTANCE_M),
-            Quaternion(0f, 180f, 0f),
+            imageBitmap = entityBitmaps[sourceEntity],
+            kind = kind,
         )
         infoPanelEntity?.let { panel ->
-            panel.setComponent(Transform(pose))
+            panel.setComponent(Transform(modalPose))
             panel.setComponent(Visible(true))
-        } ?: Log.w(TAG, "info panel entity not yet spawned (onSceneReady not called?)")
+            Log.i(TAG, "  info modal set Visible(true) at ${modalPose.t.x}, ${modalPose.t.y}, ${modalPose.t.z}")
+        } ?: Log.w(TAG, "info panel entity null — onSceneReady not done?")
+    }
 
-        Log.i(TAG, "✓ info panel shown for '${record.title}'")
+    /**
+     * Restore a video plane that was enlarged via the "big preview" path back to its original
+     * pose + scale captured in [spawnVideo]. No-op if we have no record of the original pose
+     * (defensive: a video spawned before this map existed would just stay at preview size).
+     */
+    private fun restoreVideoOriginal(videoEntity: Entity) {
+        val original = videoOriginals[videoEntity]
+        if (original == null) {
+            Log.w(TAG, "no original pose for video entity ${videoEntity.id}; cannot restore")
+            return
+        }
+        videoEntity.setComponent(Transform(original.pose))
+        videoEntity.setComponent(Scale(original.scale))
+        Log.i(TAG, "video ${videoEntity.id} restored to original pose")
+        if (previewedVideoEntity == videoEntity) previewedVideoEntity = null
     }
 
     private fun loadImageTexture(entity: Entity, url: String, title: String) {
@@ -839,7 +972,7 @@ class ImmersiveActivity : AppSystemActivity() {
      *
      * Auto-loops muted (volume = 0, repeatMode = ALL, playWhenReady = true).
      */
-    private fun spawnVideo(asset: AssetRecord, pose: Pose, scaleVec: Vector3, title: String) {
+    private fun spawnVideo(asset: AssetRecord, pose: Pose, scaleVec: Vector3, title: String, record: SceneObjectRecord) {
         // Build the ExoPlayer up-front. surfaceConsumer fires asynchronously when the Spatial
         // runtime has created the underlying GL surface for the panel, at which point we wire
         // the surface into ExoPlayer and call prepare(). Setting playWhenReady = true here
@@ -888,11 +1021,18 @@ class ImmersiveActivity : AppSystemActivity() {
 
         // The Panel component binds the entity to the registered panel id. Transform + Scale
         // place it in the world; the panel itself owns the rendered video surface.
-        Entity.create(
+        val videoEntity = Entity.create(
             Panel(panelId),
             Transform(pose),
             Scale(scaleVec),
         )
+        entityRecords[videoEntity] = record
+        entityKinds[videoEntity] = "video"
+        videoOriginals[videoEntity] = VideoOriginal(pose, scaleVec)
+        // Wire the video plane for click → "big preview" mode (see [showModalFor]). The Panel
+        // surface itself receives input events because VideoSurfacePanelRegistration installs
+        // a hittable mesh under the hood — same input path as the painting quads.
+        attachClickListener(videoEntity, title)
         spawnGoldFrame(pose, scaleVec, 1.6f, 0.9f)
     }
 
@@ -960,16 +1100,20 @@ class ImmersiveActivity : AppSystemActivity() {
                 Material().apply {
                     baseColor = color
                     unlit = true
+                    // alphaMode = 0 (opaque) — explicit, since the runtime default has bitten us
+                    // before. Keeps the gold non-blended so background light doesn't bleed in.
+                    alphaMode = 0
                 },
                 Transform(sidePose),
                 Scale(parentScale),
             )
         }
 
-        // Warm bright gold — admin's PBR (0.42, 0.32, 0.16) reads as too dull when sampled
-        // through unlit toolkit material; this tone is closer to what the admin actually paints
-        // on screen after PBR lighting brightens the gold.
-        val gold = Color4(0.95f, 0.78f, 0.42f, 1f)
+        // Saturated warm gold — bias deeper amber (0.78, 0.55, 0.20) so the runtime tonemap can
+        // brighten it toward the right hue without washing out. The previous (0.95, 0.78, 0.42)
+        // was bright enough that tonemapping + accumulation against the bright sun shifted it
+        // toward neutral-white at typical viewing distances.
+        val gold = Color4(0.78f, 0.55f, 0.20f, 1f)
         // Near-black backing — admin uses a dark PBR (0.06, 0.05, 0.06); same here via unlit.
         val backing = Color4(0.06f, 0.05f, 0.06f, 1f)
 
@@ -1232,8 +1376,9 @@ class ImmersiveActivity : AppSystemActivity() {
             Box(Vector3(-h, -h, -h), Vector3(h, h, h)),
             Material().apply {
                 // Warm gold matching the picture frames; unlit so it glows in low ambient.
-                baseColor = Color4(1.0f, 0.86f, 0.45f, 1f)
+                baseColor = Color4(0.85f, 0.62f, 0.25f, 1f)
                 unlit = true
+                alphaMode = 0
             },
             Transform(markerPose),
             Scale(parentScale),

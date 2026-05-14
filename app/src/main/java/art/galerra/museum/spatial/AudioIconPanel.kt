@@ -11,9 +11,9 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.getValue
@@ -23,25 +23,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import com.meta.spatial.uiset.theme.SpatialTheme
-import com.meta.spatial.uiset.theme.darkSpatialColorScheme
-import com.meta.spatial.uiset.theme.icons.SpatialIcons
-import com.meta.spatial.uiset.theme.icons.regular.VolumeOff
-import com.meta.spatial.uiset.theme.icons.regular.VolumeOn
+import androidx.compose.ui.unit.sp
 
 /**
- * Per-audio-source mute icon. Pinned in 3D to the audio emitter's world pose so the user can
- * see WHERE each sound is coming from and silence individual sources without nuking the global
- * audio bus (that's what [MuteButtonPanel] is for).
- *
- * Unlike the floating [MuteButtonPanel] which uses a single global state, each audio source
- * needs its own observable state + click handler. We index those by `audioKey` (the per-instance
- * id we generate in [ImmersiveActivity.spawnAudio]), and the Compose function reads from the
- * lookup map on every recomposition.
- *
- * The disc gently pulses while audio plays (visual cue that something is making noise even when
- * spatialized far away) and freezes when muted.
+ * Per-audio-source mute icon — small disc pinned in 3D to the audio emitter's pose so the user
+ * can SEE where each sound is coming from and silence individual sources without nuking the
+ * global bus. Plain Material3 — same simplification rationale as InfoPanel.kt.
  */
 
 /** Per-source mute state. true = muted. Keyed by the dynamic audio key generated in spawnAudio. */
@@ -58,32 +47,30 @@ private val MutedAccent = Color(0xFFD47A37)
 
 @Composable
 fun AudioIconPanel(audioKey: String) {
-    SpatialTheme(colorScheme = darkSpatialColorScheme()) {
-        // Bind to (or lazily create) this instance's observable state. The map is populated
-        // up-front in spawnAudio, but defensively create-on-miss so a recomposition before the
-        // activity finishes wiring doesn't crash.
-        val muteState = audioIconMuteStates.getOrPut(audioKey) { mutableStateOf(false) }
-        val muted = muteState.value
-        val ring = if (muted) MutedAccent else GoldAccent
-        val ringSoft = if (muted) Color(0x66D47A37) else GoldDim
-        val surface = if (muted) IconBackgroundMuted else IconBackgroundActive
+    // Bind to (or lazily create) this instance's observable state. The map is populated up-front
+    // in spawnAudio, but defensively create-on-miss so a recomposition before the activity
+    // finishes wiring doesn't crash.
+    val muteState = audioIconMuteStates.getOrPut(audioKey) { mutableStateOf(false) }
+    val muted = muteState.value
+    val ring = if (muted) MutedAccent else GoldAccent
+    val ringSoft = if (muted) Color(0x66D47A37) else GoldDim
+    val surface = if (muted) IconBackgroundMuted else IconBackgroundActive
 
-        // Subtle pulse while playing — a heartbeat at ~0.9 Hz signals "audio active". The
-        // pulse animation is always running (infinite transitions can't be conditionally
-        // composed without flickering), but when muted we ignore its output and lock the
-        // scale at 1f so a muted disc reads as visually static.
-        val transition = rememberInfiniteTransition(label = "audio_pulse")
-        val pulseScale by transition.animateFloat(
-            initialValue = 0.92f,
-            targetValue = 1.06f,
-            animationSpec = infiniteRepeatable(
-                animation = tween(durationMillis = 1100),
-                repeatMode = RepeatMode.Reverse,
-            ),
-            label = "audio_pulse_scale",
-        )
-        val pulse = if (muted) 1f else pulseScale
+    // Subtle pulse while playing — heartbeat at ~0.9 Hz. Always running (can't conditionally
+    // compose infinite transitions without flicker); when muted we ignore its output.
+    val transition = rememberInfiniteTransition(label = "audio_pulse")
+    val pulseScale by transition.animateFloat(
+        initialValue = 0.92f,
+        targetValue = 1.06f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1100),
+            repeatMode = RepeatMode.Reverse,
+        ),
+        label = "audio_pulse_scale",
+    )
+    val pulse = if (muted) 1f else pulseScale
 
+    MaterialTheme {
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -108,19 +95,11 @@ fun AudioIconPanel(audioKey: String) {
                         .clickable { audioIconOnClick[audioKey]?.invoke() },
                     contentAlignment = Alignment.Center,
                 ) {
-                    Icon(
-                        imageVector = if (muted) {
-                            SpatialIcons.Regular.VolumeOff
-                        } else {
-                            SpatialIcons.Regular.VolumeOn
-                        },
-                        contentDescription = if (muted) {
-                            "Unmute this audio source"
-                        } else {
-                            "Mute this audio source"
-                        },
-                        tint = ring,
-                        modifier = Modifier.size(42.dp),
+                    Text(
+                        text = if (muted) "x" else "*",
+                        color = ring,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 28.sp,
                     )
                 }
             }
