@@ -72,16 +72,20 @@ private val OnPanelDim = Color(0xCCBDB3A6)
 fun InfoPanel() {
     val state = infoPanelState.value
     MaterialTheme {
+        // The panel surface is fixed-size and transparent; the dark modal Column below wraps
+        // its content height so the box is exactly as tall as what it holds — a short caption
+        // gets a small box, not a half-empty oversized one. verticalScroll stays as a safety
+        // net for the rare description that would exceed the panel surface.
         Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .clip(RoundedCornerShape(24.dp))
-                .background(PanelBg)
-                .border(2.dp, GoldDim, RoundedCornerShape(24.dp)),
+            modifier = Modifier.fillMaxSize(),
+            contentAlignment = Alignment.Center,
         ) {
             Column(
                 modifier = Modifier
-                    .fillMaxSize()
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(24.dp))
+                    .background(PanelBg)
+                    .border(2.dp, GoldDim, RoundedCornerShape(24.dp))
                     .padding(horizontal = 32.dp, vertical = 28.dp)
                     .verticalScroll(rememberScrollState()),
             ) {
@@ -118,10 +122,12 @@ fun InfoPanel() {
                 )
                 Spacer(modifier = Modifier.size(16.dp))
 
-                // Thumbnail (images only). Defensive: skip if bitmap is recycled (rare race with
-                // the texture loader if the user reopens the modal after a release).
+                // Thumbnail for images AND video posters. Defensive: skip if bitmap is recycled
+                // (rare race with the texture loader if the user reopens the modal after a release).
+                // Video bitmaps are captured async by spawnVideo via MediaMetadataRetriever, so
+                // they may not be present yet on first click — falls back to no-poster.
                 val bmp = state.imageBitmap
-                if (bmp != null && !bmp.isRecycled && state.kind == "image") {
+                if (bmp != null && !bmp.isRecycled && (state.kind == "image" || state.kind == "video")) {
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()

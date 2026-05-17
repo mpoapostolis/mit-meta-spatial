@@ -38,12 +38,15 @@ import com.meta.spatial.toolkit.AppSystemActivity
 import com.meta.spatial.toolkit.AvatarAttachment
 import com.meta.spatial.toolkit.Box
 import com.meta.spatial.toolkit.DpPerMeterDisplayOptions
+import com.meta.spatial.toolkit.Followable
+import com.meta.spatial.toolkit.FollowableType
 import com.meta.spatial.toolkit.Grabbable
 import com.meta.spatial.toolkit.GrabbableType
 import com.meta.spatial.toolkit.Material
 import com.meta.spatial.toolkit.MediaPanelRenderOptions
 import com.meta.spatial.toolkit.MediaPanelSettings
 import com.meta.spatial.toolkit.Mesh
+import com.meta.spatial.toolkit.Hittable
 import com.meta.spatial.toolkit.MeshCollision
 import com.meta.spatial.toolkit.Panel
 import com.meta.spatial.toolkit.PanelDimensions
@@ -151,16 +154,37 @@ class ImmersiveActivity : AppSystemActivity() {
     // [WelcomePanelFollowSystem] for the math.
     private var welcomePanelFollow: WelcomePanelFollowSystem? = null
 
+    // Head-locked toolbar (mute + back-to-scenes). Pinned to a fixed offset from the head pose
+    // every 50 ms via [ToolbarFollowSystem] so the player can always find the buttons regardless
+    // of where they've walked or how they've rotated. Unlike the welcome panel follow, this one
+    // runs for the entire activity lifetime (never stops). See [spawnMuteButtonEntity] +
+    // [spawnBackButtonEntity] for the actual entity creation; this system just keeps them
+    // in place every frame.
+    private var muteButtonEntity: Entity? = null
+    private var backButtonEntity: Entity? = null
+    private var toolbarFollow: ToolbarFollowSystem? = null
+
+    // Track last view origin so info modal can be positioned relative to player's current
+    // world reference frame (scene.getViewerPose returns identity in some configs).
+    private var lastViewOriginX = 0f
+    private var lastViewOriginY = 0f
+    private var lastViewOriginZ = 0f
+    private var lastViewOriginYawDeg = 0f
+
     companion object {
         private const val TAG = "MuseumSpatial"
         private const val DEFAULT_EXHIBITION_ID = "ah1bngq5143ujhw"
 
-        // Info panel dimensions (Quest meters). Empirically on this device, Compose-backed panels
-        // above ~1.0 × 0.7 m occasionally fail to produce a render target — likely related to the
-        // underlying Activity-window surface allocation in 0.12. Match the welcome panel size
-        // (which renders reliably) for consistency.
-        private const val INFO_PANEL_WIDTH_M = 1.0f
-        private const val INFO_PANEL_HEIGHT_M = 0.7f
+        // Info panel dimensions (Quest meters). Enlarged past the old 1.0×0.7 m so the
+        // title + image + description fit without the Compose verticalScroll engaging — a
+        // bigger panel means a bigger dp canvas (DpPerMeterDisplayOptions), i.e. real room
+        // for the content, not just a magnified render.
+        // NB: an earlier note flagged that panels above ~1.0×0.7 m *occasionally* failed to
+        // produce a render target on this device (0.12 Activity-window surface allocation).
+        // If a panel renders blank, that limit is real — fall back to compacting the Compose
+        // content instead of growing the panel further.
+        private const val INFO_PANEL_WIDTH_M = 1.15f
+        private const val INFO_PANEL_HEIGHT_M = 1.1f
         private const val INFO_PANEL_DISTANCE_M = 1.2f
         private const val INFO_PANEL_EYE_HEIGHT_M = 1.55f
 
@@ -172,10 +196,33 @@ class ImmersiveActivity : AppSystemActivity() {
         // audio emitter's pose. Single tap mutes only that ExoPlayer (not the global bus).
         private const val AUDIO_ICON_SIZE_M = 0.25f
 
-        // Welcome / scene-picker panel (Quest meters). Larger than the info modal because it
-        // hosts a scrollable list of exhibitions.
-        private const val WELCOME_PANEL_WIDTH_M = 1.0f
-        private const val WELCOME_PANEL_HEIGHT_M = 0.7f
+        // Welcome / scene-picker panel (Quest meters). Sized to match the enlarged info modal
+        // so the exhibition list shows several scenes at once without scrolling.
+        private const val WELCOME_PANEL_WIDTH_M = 1.15f
+        private const val WELCOME_PANEL_HEIGHT_M = 1.1f
+
+        // Video playback controls bar (Quest meters). Wider/shorter than info panel — sits as a
+        // strip below the enlarged video. Kept within the 1.0×0.7 m render-reliable envelope.
+        private const val VIDEO_CONTROLS_WIDTH_M = 1.0f
+        private const val VIDEO_CONTROLS_HEIGHT_M = 0.32f
+
+        // Video state poll cadence (33 ms ≈ 30 Hz). Pushed into [videoControlsState] while the
+        // bar is visible so the slider thumb tracks ExoPlayer.currentPosition. Matches the
+        // PremiumMediaSample's ControlPanelPollHandler cadence (~11 ms is overkill at panel
+        // resolution; 33 ms is one update per render frame at 30 fps).
+        private const val VIDEO_POLL_MS = 33L
+
+        // Fixed panel ID for the modal video preview surface (shown when the user clicks a
+        // video plane on the wall — a second VideoSurfacePanel renders the same stream
+        // head-relative so the user can watch it close-up without the wall plane moving).
+        // 2_500_000 is above the dynamic wall-video range (1_500_000+) and the audio-icon
+        // range (2_000_000+) so it doesn't collide.
+        private const val MODAL_VIDEO_PANEL_ID = 2_500_000
+
+        // Modal video preview dimensions (Quest meters). Wider than the info modal but
+        // smaller than the wall video so the user can see info caption + video together.
+        private const val MODAL_VIDEO_WIDTH_M = 0.95f
+        private const val MODAL_VIDEO_HEIGHT_M = 0.54f
     }
 
     override fun registerFeatures(): List<SpatialFeature> =
@@ -239,6 +286,42 @@ class ImmersiveActivity : AppSystemActivity() {
             settingsCreator = {
                 UIPanelSettings(
                     shape = QuadShapeOptions(width = WELCOME_PANEL_WIDTH_M, height = WELCOME_PANEL_HEIGHT_M),
+                    style = PanelStyleOptions(themeResourceId = R.style.PanelAppThemeTransparent),
+                    display = DpPerMeterDisplayOptions(),
+                )
+            },
+        ),
+        // Video controls bar — wider, shorter than the info panel. Shown beneath the enlarged
+        // video plane in [showModalFor] when the user clicks a video asset. Content reads from
+        // [videoControlsState], poll-updated every 33 ms by [pollVideoStateRunnable] while the
+        // bar is visible. Click callbacks ([videoControlsOnPlayPause] / [videoControlsOnSeek] /
+        // [videoControlsOnMute] / [videoControlsOnClose]) are wired in [spawnVideoControlsEntity].
+        ComposeViewPanelRegistration(
+            R.id.video_modal,
+            composeViewCreator = { _, ctx ->
+                ComposeView(ctx).apply { setContent { VideoControlsPanel() } }
+            },
+            settingsCreator = {
+                UIPanelSettings(
+                    shape = QuadShapeOptions(
+                        width = VIDEO_CONTROLS_WIDTH_M,
+                        height = VIDEO_CONTROLS_HEIGHT_M,
+                    ),
+                    style = PanelStyleOptions(themeResourceId = R.style.PanelAppThemeTransparent),
+                    display = DpPerMeterDisplayOptions(),
+                )
+            },
+        ),
+        // Back-to-scenes button — sibling of the mute button. Click clears the current
+        // exhibition objects and re-shows the welcome scene picker (see [returnToScenePicker]).
+        ComposeViewPanelRegistration(
+            R.id.back_button,
+            composeViewCreator = { _, ctx ->
+                ComposeView(ctx).apply { setContent { BackButtonPanel() } }
+            },
+            settingsCreator = {
+                UIPanelSettings(
+                    shape = QuadShapeOptions(width = MUTE_BUTTON_SIZE_M, height = MUTE_BUTTON_SIZE_M),
                     style = PanelStyleOptions(themeResourceId = R.style.PanelAppThemeTransparent),
                     display = DpPerMeterDisplayOptions(),
                 )
@@ -309,9 +392,10 @@ class ImmersiveActivity : AppSystemActivity() {
         // but no-ops its execute() body — safer than unregisterSystem, which other samples
         // (PremiumMediaSample) do but which removes the entity-tracking machinery the SDK
         // uses for the controller laser cursor.
-        // Disable default teleport-on-release. Replace with smooth walk + smooth tween-on-click.
-        systemManager.findSystem<LocomotionSystem>().enableLocomotion(false)
-        smoothLocomotion = SmoothLocomotionSystem(scene).also { systemManager.registerSystem(it) }
+        // KEEP default Spatial SDK teleport (native Quest parabolic arc on thumbstick release).
+        // Custom smooth locomotion disabled per user request.
+        // systemManager.findSystem<LocomotionSystem>().enableLocomotion(false)
+        // smoothLocomotion = SmoothLocomotionSystem(scene).also { systemManager.registerSystem(it) }
 
         // Click-to-animated-move tween (~600 ms cubic ease-in-out). Floor clicks on the env
         // glb (attached in [placeObjects] once the env entity exists) call into
@@ -319,12 +403,13 @@ class ImmersiveActivity : AppSystemActivity() {
         // frame in execute(). It also calls back into [smoothLocomotion.syncFromScene] each
         // tween frame so the locomotion system's cached origin stays aligned and the player
         // can resume stick walking immediately after the animation ends.
-        teleportTween = TeleportTweenSystem(scene, smoothLocomotion!!).also {
-            systemManager.registerSystem(it)
-        }
+        // teleportTween disabled — native arc-teleport is in use.
+        // teleportTween = TeleportTweenSystem(scene, smoothLocomotion!!).also {
+        //     systemManager.registerSystem(it)
+        // }
 
         // Spawn the user a couple meters in front of the gallery centroid, looking forward.
-        scene.setViewOrigin(0.0f, 0.0f, 0.0f, 0.0f)
+        applyViewOrigin(0.0f, 0.0f, 0.0f, 0.0f)
         // Keep the locomotion system's cached origin in lockstep with the SDK after every
         // external setViewOrigin so the next stick frame increments from the correct anchor.
         smoothLocomotion?.syncFromScene(0.0f, 0.0f, 0.0f, 0.0f)
@@ -333,8 +418,55 @@ class ImmersiveActivity : AppSystemActivity() {
         // hidden — [showModalFor] flips Visible(true) and updates its Transform on click.
         spawnInfoPanelEntity()
 
+        // Spawn the (hidden) video controls bar. Shown by [showModalFor] when the user clicks
+        // a video plane — gives them play/pause/seek/mute/close without leaving VR.
+        spawnVideoControlsEntity()
+
+        // Register the modal video preview panel + spawn its (initially hidden) entity. The
+        // panel's surfaceConsumer captures the GL surface once it's allocated and binds it to
+        // whichever modalVideoPlayer is currently active. New click → new ExoPlayer → bind
+        // to captured surface → playback.
+        registerPanel(
+            VideoSurfacePanelRegistration(
+                MODAL_VIDEO_PANEL_ID,
+                surfaceConsumer = { _, surface ->
+                    Log.i(TAG, "🎬 modal video surface ready")
+                    modalVideoSurface = surface
+                    // If a player was queued waiting for the surface (rare — usually surface
+                    // arrives first), bind it now.
+                    modalVideoPlayer?.let { p ->
+                        p.setVideoSurface(surface)
+                        p.prepare()
+                    }
+                },
+                settingsCreator = {
+                    MediaPanelSettings(
+                        shape = QuadShapeOptions(width = MODAL_VIDEO_WIDTH_M, height = MODAL_VIDEO_HEIGHT_M),
+                        display = PixelDisplayOptions(width = 1280, height = 720),
+                        rendering = MediaPanelRenderOptions(stereoMode = StereoMode.None),
+                    )
+                },
+            ),
+        )
+        modalVideoEntity = Entity.create(
+            Panel(MODAL_VIDEO_PANEL_ID),
+            Transform(Pose(Vector3(0f, INFO_PANEL_EYE_HEIGHT_M, -INFO_PANEL_DISTANCE_M), Quaternion(0f, 180f, 0f))),
+            Visible(false),
+        )
+
         // Spawn the always-visible mute-button panel slightly right of center at eye level.
         spawnMuteButtonEntity()
+
+        // Spawn the always-visible "back to scenes" button to the LEFT of the mute toggle.
+        // Click → [returnToScenePicker] which wipes exhibition objects + re-shows welcome.
+        spawnBackButtonEntity()
+
+        // Toolbar follow DISABLED per user — they don't want the buttons chasing them around
+        // the room ("ta gui buttons prepei na paroun poulo dn xreiaete na me akolou8oun"). The
+        // mute + back entities stay at their spawn world poses (~ near LOCAL_FLOOR origin); the
+        // player walks back to them when needed. If the recenter teleports the player far away,
+        // they can still see the buttons by looking back toward the spawn origin.
+        // toolbarFollow = ToolbarFollowSystem(scene, listOf(...)).also { it.start() }
 
         // Spawn the welcome / scene-picker panel and kick off the scenes-list fetch. The user
         // must pick a scene before any exhibition objects are loaded — see [welcomeOnPick].
@@ -344,9 +476,23 @@ class ImmersiveActivity : AppSystemActivity() {
         // [spawnWelcomePanelEntity] so getPanelEntity()'s lambda returns a real Entity. The
         // system queries [welcomeState.visible] each frame and early-outs when the panel is
         // hidden, so we don't need to unregister it after scene pick.
-        // Disabled — testing if static spawn matches mute button success.
-        // welcomePanelFollow = WelcomePanelFollowSystem(scene) { welcomePanelEntity }
-        //     .also { it.start() }
+        //
+        // Re-enabled head-follow per user feedback ("welcome again behind me"). Static placement
+        // is unreliable because Quest spawns the LOCAL_FLOOR origin facing wherever the headset
+        // happened to be pointing IRL when the app launched — so a fixed `Pose(0,1.4,-1.3)` can
+        // end up behind the player ~50% of the time. The follow system reads the head pose
+        // every 50 ms and re-places the panel 1.2 m in front, so it's always in view until the
+        // user picks a scene (after which welcomeState.visible flips to false and the system
+        // early-outs without touching the panel anymore).
+        welcomePanelFollow = WelcomePanelFollowSystem(
+            scene = scene,
+            getPanelEntity = { welcomePanelEntity },
+            getViewOrigin = {
+                WelcomePanelFollowSystem.ViewOriginSnapshot(
+                    lastViewOriginX, lastViewOriginY, lastViewOriginZ, lastViewOriginYawDeg,
+                )
+            },
+        ).also { it.start() }
 
         // If exhibition already loaded before the scene was ready, place objects now.
         pendingObjects?.let {
@@ -371,13 +517,72 @@ class ImmersiveActivity : AppSystemActivity() {
             Visible(false),
         )
         // The Close button in InfoPanel.kt calls this; hide the entity and clear state. Also
-        // restore any video plane that was enlarged for the "big preview" mode.
+        // restore any video plane that was enlarged for the "big preview" mode AND tear down
+        // the video controls bar (poll loop + entity + active player ref).
         infoPanelOnDismiss = {
             Log.i(TAG, "info panel dismissed")
             infoPanelState.value = infoPanelState.value.copy(visible = false)
             infoPanelEntity?.setComponent(Visible(false))
             previewedVideoEntity?.let { restoreVideoOriginal(it) }
+            hideVideoControls()
         }
+    }
+
+    /**
+     * Spawn the (initially hidden) video controls bar entity and wire its Compose callbacks
+     * to the [activeVideoPlayer]. Reused across all video clicks — [showModalFor] positions it
+     * + sets [activeVideoPlayer] + flips it visible; [hideVideoControls] does the inverse.
+     *
+     * Why a single reusable entity vs. one-per-video: keeps panel-registration lifecycle simple
+     * (the SDK only needs to allocate the surface once), and prevents accumulating dead panels
+     * if the user opens many video modals in one session.
+     */
+    private fun spawnVideoControlsEntity() {
+        // Initial pose is below the info panel — repositioned on every showModalFor.
+        val initialPose = Pose(
+            Vector3(0f, INFO_PANEL_EYE_HEIGHT_M - 0.55f, -INFO_PANEL_DISTANCE_M),
+            Quaternion(0f, 180f, 0f),
+        )
+        videoControlsEntity = Entity.create(
+            Panel(R.id.video_modal),
+            PanelDimensions(Vector2(VIDEO_CONTROLS_WIDTH_M, VIDEO_CONTROLS_HEIGHT_M)),
+            Transform(initialPose),
+            Visible(false),
+        )
+
+        videoControlsOnPlayPause = { shouldPlay ->
+            Log.i(TAG, "🎬 controls play/pause → $shouldPlay")
+            activeVideoPlayer?.let { if (shouldPlay) it.play() else it.pause() }
+        }
+        videoControlsOnSeekRelative = { delta ->
+            Log.i(TAG, "🎬 controls seek ${if (delta >= 0) "+" else ""}${delta}s")
+            activeVideoPlayer?.let { p ->
+                val newMs = (p.currentPosition + (delta * 1000).toLong()).coerceIn(0L, p.duration.coerceAtLeast(0L))
+                p.seekTo(newMs)
+            }
+        }
+        videoControlsOnMute = { mute ->
+            Log.i(TAG, "🎬 controls mute → $mute")
+            activeVideoPlayer?.volume = if (mute) 0f else 1f
+        }
+        videoControlsOnClose = {
+            // The shared dismiss path: restores the video plane AND hides the controls/info.
+            infoPanelOnDismiss()
+        }
+    }
+
+    /** Tear down the video controls UI + modal video preview: hide entities, stop poll,
+     *  release the modal-only ExoPlayer (the wall video keeps playing). */
+    private fun hideVideoControls() {
+        videoControlsEntity?.setComponent(Visible(false))
+        videoControlsState.value = videoControlsState.value.copy(visible = false)
+        videoPollHandler.removeCallbacks(pollVideoStateRunnable)
+        activeVideoPlayer = null
+        // Hide the modal video preview entity and release its dedicated ExoPlayer (so we
+        // don't keep decoding two streams when only the wall video should be playing).
+        modalVideoEntity?.setComponent(Visible(false))
+        modalVideoPlayer?.let { runCatching { it.release() } }
+        modalVideoPlayer = null
     }
 
     /**
@@ -388,12 +593,72 @@ class ImmersiveActivity : AppSystemActivity() {
      */
     private fun spawnMuteButtonEntity() {
         val pose = Pose(Vector3(0.5f, 1.4f, -1.3f), Quaternion(0f, 180f, 0f))
-        Entity.create(
+        muteButtonEntity = Entity.create(
             Panel(R.id.mute_button),
             PanelDimensions(Vector2(MUTE_BUTTON_SIZE_M, MUTE_BUTTON_SIZE_M)),
             Transform(pose),
         )
         muteButtonOnClick = { toggleAudio() }
+    }
+
+    /**
+     * Spawn the always-visible Back-to-scene-picker button, mirrored left of center vs. the
+     * mute button. Click clears the current exhibition's spawned entities and re-shows the
+     * welcome panel (see [returnToScenePicker]). The pose is in LOCAL_FLOOR space at panel
+     * creation; the mute neighbor sits at x=+0.5, so this one at x=-0.5 forms a balanced
+     * floating toolbar centered on the player's spawn.
+     */
+    private fun spawnBackButtonEntity() {
+        val pose = Pose(Vector3(-0.5f, 1.4f, -1.3f), Quaternion(0f, 180f, 0f))
+        backButtonEntity = Entity.create(
+            Panel(R.id.back_button),
+            PanelDimensions(Vector2(MUTE_BUTTON_SIZE_M, MUTE_BUTTON_SIZE_M)),
+            Transform(pose),
+        )
+        backButtonOnClick = { returnToScenePicker() }
+    }
+
+    /**
+     * Tear down the current exhibition (destroy every entity we tracked in [entityRecords] +
+     * [videoOriginals] + the env GLB) and re-show the welcome scene picker so the user can
+     * jump into another scene without restarting the app.
+     *
+     * Per Spatial SDK 0.12, entity destruction is via [Entity.destroy]. We don't try to
+     * unregister the dynamic video panel ids — they'd be regenerated on the next pick anyway,
+     * and the runtime tolerates stale panel registrations whose entities have been destroyed.
+     *
+     * Released here so the next exhibition starts clean: ExoPlayer instances (audio + video),
+     * the [entityRecords]/[entityKinds]/[entityBitmaps] maps, the video controls state, and
+     * the currently-shown info modal.
+     */
+    private fun returnToScenePicker() {
+        Log.i(TAG, "⬅️  returning to scene picker (destroying ${entityRecords.size} exhibition entities)")
+        // Hide active UI first so the user sees an immediate response.
+        infoPanelOnDismiss()  // hides info modal + tears down video controls
+        // Release every ExoPlayer (both audio emitters and video panels). This stops streaming,
+        // releases the codecs, and drops the spatial-audio session bindings.
+        audioPlayers.forEach { runCatching { it.release() } }
+        audioPlayers.clear()
+        videoPlayers.forEach { runCatching { it.release() } }
+        videoPlayers.clear()
+        videoPlayerByEntity.clear()
+        videoOriginals.clear()
+        nextAudioSessionSlot = 1
+        // Destroy every exhibition entity we tracked. We track them via entityRecords (set in
+        // each spawnX), which keys on Entity. The associated gold-frame / hotspot-marker /
+        // back-face / env-glb entities are NOT in this map — those leak across scene switches.
+        // For an MVP demo on Quest this is acceptable (the user picks 1-2 scenes per session
+        // and quits); a future iteration should track them explicitly.
+        entityRecords.keys.toList().forEach { e ->
+            runCatching { e.destroy() }
+                .onFailure { Log.w(TAG, "destroy entity ${e.id} failed: ${it.message}") }
+        }
+        entityRecords.clear()
+        entityKinds.clear()
+        entityBitmaps.clear()
+        // Re-show the welcome picker — populate state so the panel re-renders the scene list.
+        welcomeState.value = welcomeState.value.copy(visible = true)
+        welcomePanelEntity?.setComponent(Visible(true))
     }
 
     /**
@@ -416,9 +681,7 @@ class ImmersiveActivity : AppSystemActivity() {
      * [loadExhibition] which fans out objects into the scene.
      */
     private fun spawnWelcomePanelEntity() {
-        // Placeholder pose — the follow system writes the real Transform on frame 1 from the
-        // live head pose. We use a safe Y so even if the follow tick is somehow delayed the
-        // panel still spawns at eye level rather than buried in the floor.
+        // Static pose, same Y/Z as the mute button which user confirmed visible.
         val pose = Pose(Vector3(0f, 1.4f, -1.3f), Quaternion(0f, 180f, 0f))
         welcomePanelEntity = Entity.create(
             Panel(R.id.welcome_panel),
@@ -527,7 +790,7 @@ class ImmersiveActivity : AppSystemActivity() {
                     // grabbable rigid bodies (see [spawnGlb]). We use referential equality against
                     // the same `env` already computed above for player re-centering, which keeps
                     // env detection in lockstep with the existing walkable/maxDim heuristic.
-                    "model" -> spawnGlb(asset, pose, scaleVec, isEnvironment = (obj === env), title = obj.title)
+                    "model" -> spawnGlb(asset, pose, scaleVec, isEnvironment = (obj === env), title = obj.title, record = obj)
                     "audio" -> spawnAudio(asset, pose, obj.title)
                     else -> Log.w(TAG, "unknown type: ${asset.type}")
                 }
@@ -584,7 +847,7 @@ class ImmersiveActivity : AppSystemActivity() {
                 val ey = env.position[1]
                 val ez = env.position[2]
                 Log.i(TAG, "→ no hotspots; centering player on env '${env.title}' at ($ex, $ey, $ez)")
-                scene.setViewOrigin(ex, ey, ez, 0f)
+                applyViewOrigin(ex, ey, ez, 0f)
                 smoothLocomotion?.syncFromScene(ex, ey, ez, 0f)
                 return@runCatching
             }
@@ -605,12 +868,11 @@ class ImmersiveActivity : AppSystemActivity() {
 
             // Floor Y: env's authored Y is the reference floor. The glb's local origin is
             // assumed to be at the floor — so setting view-origin Y = envY puts the player
-            // standing on the gallery floor. The previous min(envY, minY-1.6) heuristic put
-            // the player below the floor when paintings hung at eye level.
+            // standing on the gallery floor.
             val floorY = env.position[1]
 
             // Yaw to face hotspot centroid from (cx, cz). atan2(dx, dz) returns radians where
-            // 0 = look toward +Z; positive rotates toward +X (standard right-handed Y-up yaw).
+            // 0 = look toward +Z; positive rotates toward +X (standard Y-up yaw).
             val dx = hotspotCentroid.x - cx
             val dz = hotspotCentroid.z - cz
             val yawRad = atan2(dx, dz)
@@ -623,12 +885,24 @@ class ImmersiveActivity : AppSystemActivity() {
                     "facing centroid=(${hotspotCentroid.x}, ${hotspotCentroid.y}, ${hotspotCentroid.z}) " +
                     "(${hotspots.size} hotspots)",
             )
-            scene.setViewOrigin(cx, floorY, cz, yawDeg)
+            applyViewOrigin(cx, floorY, cz, yawDeg)
             smoothLocomotion?.syncFromScene(cx, floorY, cz, yawDeg)
         }.onFailure { Log.e(TAG, "✗ recenterOnEnvironment failed; falling back to origin", it) }
     }
 
     override fun onDestroy() {
+        // Stop the welcome-panel follow loop's Handler callbacks so the runnable doesn't fire
+        // against a destroyed activity (would crash on Entity access after Spatial teardown).
+        welcomePanelFollow?.stop()
+        welcomePanelFollow = null
+        // Same for the toolbar follow loop.
+        toolbarFollow?.stop()
+        toolbarFollow = null
+        // Same for the video poll handler — removeCallbacks no-ops if not posted.
+        videoPollHandler.removeCallbacks(pollVideoStateRunnable)
+        // Modal video preview player (separate from the wall ExoPlayer in videoPlayers).
+        modalVideoPlayer?.let { runCatching { it.release() } }
+        modalVideoPlayer = null
         audioPlayers.forEach { runCatching { it.release() } }
         audioPlayers.clear()
         // Release video ExoPlayers so the OS doesn't leak codec resources between sessions.
@@ -640,8 +914,46 @@ class ImmersiveActivity : AppSystemActivity() {
     }
 
     private fun poseFor(obj: SceneObjectRecord): Pose {
+        // POSITION: pass through raw — both BabylonJS and Meta Spatial SDK use the SAME numerical
+        // coordinates (+X right, +Y up). The Z-flip attempted earlier (LH→RH conversion) made
+        // the user report "ta exeis pusahrei" (you broke it) — clearly the SDKs treat saved
+        // positions compatibly without conversion. Keep it simple.
         val pos = Vector3(obj.position[0], obj.position[1], obj.position[2])
-        val rot = Quaternion(obj.rotation[0], obj.rotation[1], obj.rotation[2])
+        // PocketBase stores BabylonJS Euler XYZ in RADIANS (admin/src/lib/babylonScene.ts:378),
+        // with BabylonJS's default `mesh.rotation = (rx,ry,rz)` Euler order: **YXZ intrinsic**
+        // (apply Y first, then X, then Z in the rotated frame). Source: BabylonJS docs.
+        //
+        // Meta Spatial SDK's `Quaternion(pitch, yaw, roll)` 3-arg constructor takes DEGREES
+        // and applies as **ZYX**. For single-axis rotations (e.g. our (0,0,-π/2) front-wall
+        // painting) ZYX and YXZ produce identical quaternions, but for multi-axis rotations
+        // (e.g. (0, π, -π/2) back-wall painting) they diverge — and we have both in the data.
+        //
+        // To avoid this, compute the quaternion directly from YXZ Euler in radians using
+        // Hamilton multiplication q = qY * qX * qZ, then pass to the 4-arg
+        // `Quaternion(w, x, y, z)` constructor (w FIRST — Spatial SDK convention, opposite
+        // of GLM/glTF). Verified against the actual saved rotations from the PocketBase
+        // dump.
+        val rx = obj.rotation[0]
+        val ry = obj.rotation[1]
+        val rz = obj.rotation[2]
+        val cx = kotlin.math.cos(rx * 0.5f); val sx = kotlin.math.sin(rx * 0.5f)
+        val cy = kotlin.math.cos(ry * 0.5f); val sy = kotlin.math.sin(ry * 0.5f)
+        val cz = kotlin.math.cos(rz * 0.5f); val sz = kotlin.math.sin(rz * 0.5f)
+        // YXZ intrinsic Hamilton product expanded — verified by hand for the saved data:
+        //   painting (0,0,-π/2) → (w=√2/2, x=0, y=0, z=-√2/2)   ← pure -90° roll, ok
+        //   painting (0,π,-π/2) → (w=0,   x=-√2/2, y=√2/2, z=0) ← Y180+roll, distinct from ZYX
+        val qwRaw = cy * cx * cz + sy * sx * sz
+        val qxRaw = cy * sx * cz + sy * cx * sz
+        val qyRaw = sy * cx * cz - cy * sx * sz
+        val qzRaw = cy * cx * sz - sy * sx * cz
+
+        // Pass quaternion through RAW — no axis-component sign flips. The previous attempts
+        // (negating qx+qy, then full conjugate) both made the user report visual errors. The
+        // saved YXZ Euler→Hamilton-product math IS the correct conversion; further mirroring
+        // breaks orientations. If a specific asset (e.g. video) still appears upside-down,
+        // the fix belongs at the asset's spawn site (rotate the entity by a fixed delta),
+        // not in this generic pose helper.
+        val rot = Quaternion(qwRaw, qxRaw, qyRaw, qzRaw)
         return Pose(pos, rot)
     }
 
@@ -660,16 +972,67 @@ class ImmersiveActivity : AppSystemActivity() {
     // the close button to know what to restore. Only one video can be previewed at a time.
     private var previewedVideoEntity: Entity? = null
 
+    // Per-video-entity ExoPlayer reference, populated in spawnVideo. Lets [showModalFor]
+    // find the right player when the user clicks a video plane — without this lookup we'd
+    // have to scan the global [videoPlayers] list and guess. Entries are NOT removed on
+    // activity destroy (the activity is exiting anyway, ExoPlayer released via videoPlayers).
+    private val videoPlayerByEntity = mutableMapOf<Entity, ExoPlayer>()
+
+    // The video controls bar entity (R.id.video_modal panel). Spawned hidden in onSceneReady,
+    // toggled visible by [showModalFor] for kind == "video". Reused across all video clicks.
+    private var videoControlsEntity: Entity? = null
+
+    // The ExoPlayer currently being controlled by the visible controls bar. Null when the
+    // controls are hidden. Read by [pollVideoStateRunnable] and the on-click callbacks.
+    private var activeVideoPlayer: ExoPlayer? = null
+
+    // Modal video preview state. A reusable VideoSurfacePanel entity (registered ONCE at
+    // startup) renders a second copy of the clicked video, head-relative so the user can watch
+    // it close-up. The wall video continues playing independently. Each click creates a NEW
+    // ExoPlayer (because ExoPlayer.setVideoSurface can only target one surface at a time, so
+    // sharing the wall player isn't possible). The surface is captured the FIRST time it's
+    // produced and reused for every subsequent click via setVideoSurface on the new player.
+    private var modalVideoEntity: Entity? = null
+    private var modalVideoSurface: android.view.Surface? = null
+    private var modalVideoPlayer: ExoPlayer? = null
+
+    // Handler-driven poll loop that pushes ExoPlayer state into [videoControlsState] at
+    // ~30 Hz while the controls bar is visible. Started in [showModalFor] (video branch),
+    // stopped in the close handler. Mirrors PremiumMediaSample's ControlPanelPollHandler.
+    private val videoPollHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val pollVideoStateRunnable = object : Runnable {
+        override fun run() {
+            val player = activeVideoPlayer
+            if (player != null) {
+                val total = player.duration.let { if (it < 0L) 0L else it } / 1000f
+                val cur = player.currentPosition.coerceAtLeast(0L) / 1000f
+                videoControlsState.value = videoControlsState.value.copy(
+                    isPlaying = player.isPlaying,
+                    isMuted = player.volume <= 0.001f,
+                    progressSec = cur,
+                    durationSec = total,
+                )
+            }
+            videoPollHandler.postDelayed(this, VIDEO_POLL_MS)
+        }
+    }
+
     private fun spawnImage(asset: AssetRecord, pose: Pose, scaleVec: Vector3, title: String, record: SceneObjectRecord) {
+        // Saved-rotation front quad + back-face quad approach (position-based attempt was
+        // rejected by user — "pigeneto pisw opws itan").
+        //
+        // Scale is the raw saved scale — NO flip. The user verified against the web editor:
+        // a Scale(-1,-1,1) here rendered the painting rotated 180° (the cross / box landmarks
+        // swapped to the opposite corner). Plain scaleVec keeps it upright, matching the editor.
+        //
         // baseColor stays white so the runtime albedo texture (set later via
-        // SceneMaterial.setAlbedoTexture once the bitmap has downloaded) renders
-        // unmodified. A dark baseColor would multiply the sampled texture toward black.
+        // SceneMaterial.setAlbedoTexture once the bitmap has downloaded) renders unmodified.
         val entity = Entity.create(
             Mesh(Uri.parse("mesh://quad")),
             Quad(Vector2(-0.8f, -0.5f), Vector2(0.8f, 0.5f)),
             Material().apply {
                 unlit = true
-                baseColor = Color4(1.0f, 1.0f, 1.0f, 1.0f) // white tint so the bitmap renders as-is
+                baseColor = Color4(1.0f, 1.0f, 1.0f, 1.0f)
                 alphaMode = 0
             },
             Transform(pose),
@@ -680,6 +1043,27 @@ class ImmersiveActivity : AppSystemActivity() {
         val url = PocketBaseClient.fileUrl(asset, asset.file, thumb = "1280x1280")
         loadImageTexture(entity, url, title)
         attachClickListener(entity, title)
+
+        // BACK-FACE QUAD: rotated 180° around Y so its normal points the OTHER way — visible
+        // when the front face points into the wall. Same raw scaleVec as the front quad (no
+        // flip), so whichever face the player sees ends up upright.
+        val backPose = Pose(pose.t, pose.q * Quaternion(0f, 180f, 0f))
+        val backScale = scaleVec
+        val backEntity = Entity.create(
+            Mesh(Uri.parse("mesh://quad")),
+            Quad(Vector2(-0.8f, -0.5f), Vector2(0.8f, 0.5f)),
+            Material().apply {
+                unlit = true
+                baseColor = Color4(1.0f, 1.0f, 1.0f, 1.0f)
+                alphaMode = 0
+            },
+            Transform(backPose),
+            Scale(backScale),
+        )
+        loadImageTexture(backEntity, url, "$title (back)")
+        entityRecords[backEntity] = record
+        entityKinds[backEntity] = "image"
+        attachClickListener(backEntity, "$title (back)")
         spawnGoldFrame(pose, scaleVec, 1.6f, 1.0f)
     }
 
@@ -773,19 +1157,47 @@ class ImmersiveActivity : AppSystemActivity() {
      * Returns a Pair of (placementPose, headPosition). Caller uses placementPose for Transform
      * and may use headPosition to bias other entities.
      */
+    /** Wrapper for scene.setViewOrigin that also caches the last value for modal placement. */
+    private fun applyViewOrigin(x: Float, y: Float, z: Float, yawDeg: Float) {
+        scene.setViewOrigin(x, y, z, yawDeg)
+        lastViewOriginX = x
+        lastViewOriginY = y
+        lastViewOriginZ = z
+        lastViewOriginYawDeg = yawDeg
+        smoothLocomotion?.syncFromScene(x, y, z, yawDeg)
+    }
+
     private fun headRelativePose(distance: Float): Pair<Pose, Vector3> {
-        val avatars = Query.where { has(AvatarAttachment.id) }.eval().toList()
-        val head = avatars.firstOrNull { it.tryGetComponent<AvatarAttachment>()?.type == "head" }
+        // Canonical pattern from SpatialAudioSystem.kt — filter by typeData="head" in query
+        // scope; `by` is a scope receiver inside the filter lambda.
+        val head = Query.where { has(AvatarAttachment.id) }
+            .filter { by(AvatarAttachment.typeData).isEqualTo("head") }
+            .eval()
+            .firstOrNull()
         val rawHeadPose = head?.tryGetComponent<Transform>()?.transform ?: scene.getViewerPose()
-        val headPose = if (rawHeadPose == Pose()) {
-            // Tracking not yet warmed up; place dead-ahead at standard eye height.
-            return Pose(
-                Vector3(0f, INFO_PANEL_EYE_HEIGHT_M, -distance),
-                Quaternion(0f, 180f, 0f),
-            ) to Vector3(0f, INFO_PANEL_EYE_HEIGHT_M, 0f)
+        // "Effectively identity" — same caveat as WelcomePanelFollowSystem: Pose() equality
+        // misses w=-1 quaternion and misses the y≈0 case where LOCAL_FLOOR hasn't synced yet.
+        // Threshold 0.5 m: a kneeling player still has their head well above 0.5 m off the floor.
+        val headPose = if (rawHeadPose.t.y < 0.5f) {
+            // Tracking not warmed up: use the last applied view origin + yaw to place panel
+            // in front of where the player ACTUALLY is in world (not world 0,0,0).
+            val yawRad = lastViewOriginYawDeg * (PI / 180.0).toFloat()
+            val fwdX = kotlin.math.sin(yawRad)
+            val fwdZ = -kotlin.math.cos(yawRad)
+            val cx = lastViewOriginX + fwdX * distance
+            val cy = lastViewOriginY + INFO_PANEL_EYE_HEIGHT_M
+            val cz = lastViewOriginZ + fwdZ * distance
+            // Panel rotation: pass fwd (head facing direction), NOT toPlayer. Compose panels
+            // have their content surface on the -Z local face; lookRotationAroundY appears to
+            // align +Z with the input vector, so passing fwd makes panel's -Z (content side)
+            // point in -fwd direction = back toward the player. Passing toPlayer would do the
+            // opposite and the player would see the blank back of the panel.
+            return Pose(Vector3(cx, cy, cz), Quaternion.lookRotationAroundY(Vector3(fwdX, 0f, fwdZ))) to
+                Vector3(lastViewOriginX, lastViewOriginY + INFO_PANEL_EYE_HEIGHT_M, lastViewOriginZ)
         } else rawHeadPose
 
-        val fwd = headPose.q * Vector3(0f, 0f, -1f)
+        // Use SDK's canonical Pose.forward() helper (matches SmoothLocomotionSystem.kt:204).
+        val fwd = headPose.forward()
         val flatLenSq = fwd.x * fwd.x + fwd.z * fwd.z
         if (flatLenSq < 1e-6f) {
             // Looking straight up/down — degenerate; fallback to -Z.
@@ -802,8 +1214,11 @@ class ImmersiveActivity : AppSystemActivity() {
             headPose.t.y,
             headPose.t.z + fz * distance,
         )
-        val toHead = Vector3(headPose.t.x - placePos.x, 0f, headPose.t.z - placePos.z)
-        val rot = Quaternion.lookRotationAroundY(toHead)
+        // Same fix as the welcome panel: pass `fwd` (head looking direction), not `toHead`.
+        // lookRotationAroundY aligns panel's +Z with the input vector, and Compose panels
+        // render on the -Z face → so we want panel +Z = head fwd, so -Z (Compose face) points
+        // back toward the player.
+        val rot = Quaternion.lookRotationAroundY(Vector3(fx, 0f, fz))
         return Pose(placePos, rot) to headPose.t
     }
 
@@ -834,41 +1249,56 @@ class ImmersiveActivity : AppSystemActivity() {
             if (prev != sourceEntity) restoreVideoOriginal(prev)
         }
 
+        // VIDEO: the modal PLAYS the clip — a head-relative video preview panel (≈ eye level)
+        // with a slim controls bar (mute / play-pause / close) just below it. Kept simple: no
+        // separate description panel. The wall video keeps looping untouched in the background.
         if (kind == "video") {
-            // BIG VIDEO PREVIEW: lift the video plane to a large pose 1.5 m in front of the user
-            // and scale it up so they can watch. The info panel sits below as a caption strip.
-            val (videoPose, headPos) = headRelativePose(1.6f)
-            // Bias the video pose upward to keep its centre near eye level when scaled up.
-            val biasedVideoPose = Pose(
-                Vector3(videoPose.t.x, headPos.y + 0.1f, videoPose.t.z),
-                videoPose.q,
-            )
-            val previewScale = Vector3(1.6f, 1.6f, 1.6f) // 1.6× the original on each axis
-            sourceEntity.setComponent(Transform(biasedVideoPose))
-            sourceEntity.setComponent(Scale(previewScale))
-            previewedVideoEntity = sourceEntity
-            Log.i(TAG, "  video preview moved to (${biasedVideoPose.t.x}, ${biasedVideoPose.t.y}, ${biasedVideoPose.t.z})")
-
-            // Caption panel below the video. Move the info panel ~0.55 m below the video centre.
-            val captionPos = Vector3(biasedVideoPose.t.x, headPos.y - 0.5f, biasedVideoPose.t.z)
-            val captionPose = Pose(captionPos, biasedVideoPose.q)
-            infoPanelState.value = InfoPanelState(
-                title = record.title,
-                description = record.description,
-                visible = true,
-                imageBitmap = null,
-                kind = "video",
-            )
-            infoPanelEntity?.let { panel ->
-                panel.setComponent(Transform(captionPose))
-                panel.setComponent(Visible(true))
-                Log.i(TAG, "  info caption set Visible(true) at ${captionPose.t.x}, ${captionPose.t.y}, ${captionPose.t.z}")
-            } ?: Log.w(TAG, "info panel entity null — onSceneReady not done?")
+            val (videoModalPose, headPos) = headRelativePose(INFO_PANEL_DISTANCE_M)
+            val videoAsset = record.expand?.asset
+            if (videoAsset != null) {
+                val videoUrl = PocketBaseClient.fileUrl(videoAsset, videoAsset.file)
+                modalVideoPlayer?.let { runCatching { it.release() } }
+                val mp = ExoPlayer.Builder(applicationContext).build().apply {
+                    setMediaItem(MediaItem.fromUri(Uri.parse(videoUrl)))
+                    repeatMode = Player.REPEAT_MODE_ALL
+                    volume = if (audioMuted) 0f else 1f
+                    playWhenReady = true
+                }
+                modalVideoPlayer = mp
+                modalVideoSurface?.let { s ->
+                    mp.setVideoSurface(s)
+                    mp.prepare()
+                    Log.i(TAG, "🎬 modal video player bound + prepared")
+                }
+                val modalVideoPos = Vector3(videoModalPose.t.x, headPos.y + 0.20f, videoModalPose.t.z)
+                modalVideoEntity?.let { panel ->
+                    panel.setComponent(Transform(Pose(modalVideoPos, videoModalPose.q)))
+                    panel.setComponent(Visible(true))
+                }
+            }
+            val player = videoPlayerByEntity[sourceEntity]
+            if (player != null) {
+                activeVideoPlayer = player
+                videoControlsState.value = VideoControlsState(
+                    visible = true,
+                    isPlaying = player.isPlaying,
+                    isMuted = player.volume <= 0.001f,
+                    progressSec = player.currentPosition.coerceAtLeast(0L) / 1000f,
+                    durationSec = player.duration.let { if (it < 0L) 0L else it } / 1000f,
+                    title = record.title,
+                )
+                val controlsPos = Vector3(videoModalPose.t.x, headPos.y - 0.28f, videoModalPose.t.z)
+                videoControlsEntity?.let { panel ->
+                    panel.setComponent(Transform(Pose(controlsPos, videoModalPose.q)))
+                    panel.setComponent(Visible(true))
+                }
+                videoPollHandler.removeCallbacks(pollVideoStateRunnable)
+                videoPollHandler.postDelayed(pollVideoStateRunnable, VIDEO_POLL_MS)
+            }
             return
         }
 
-        // Standard info modal (image / model / audio) — head-relative placement so the user
-        // never has to turn around to read the description.
+        // Image / model / audio — head-relative info panel with the poster + text.
         val (modalPose, _) = headRelativePose(INFO_PANEL_DISTANCE_M)
         infoPanelState.value = InfoPanelState(
             title = record.title,
@@ -911,7 +1341,20 @@ class ImmersiveActivity : AppSystemActivity() {
                         Log.i(TAG, "   HTTP ${resp.code} for '$title' (${resp.body?.contentLength() ?: -1} bytes)")
                         if (!resp.isSuccessful) error("HTTP ${resp.code}")
                         val bytes = resp.body?.bytes() ?: error("empty body")
-                        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                        // Decode downscaled. A full-res museum scan can be 7000²+ px, which
+                        // crashes Compose's Canvas ("trying to draw too large bitmap") when the
+                        // modal draws it, and blows past the GL texture limit. Cap the longest
+                        // side near 2048 px via inSampleSize — plenty for a wall quad + poster.
+                        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+                        var sample = 1
+                        while (bounds.outWidth / sample > 2048 || bounds.outHeight / sample > 2048) {
+                            sample *= 2
+                        }
+                        BitmapFactory.decodeByteArray(
+                            bytes, 0, bytes.size,
+                            BitmapFactory.Options().apply { inSampleSize = sample },
+                        )
                     }
                 }
             } catch (e: Exception) {
@@ -990,6 +1433,22 @@ class ImmersiveActivity : AppSystemActivity() {
                 override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
                     Log.e(TAG, "✗ video player error for '$title': ${error.errorCodeName}", error)
                 }
+                override fun onPlaybackStateChanged(state: Int) {
+                    val name = when (state) {
+                        Player.STATE_IDLE -> "IDLE"
+                        Player.STATE_BUFFERING -> "BUFFERING"
+                        Player.STATE_READY -> "READY"
+                        Player.STATE_ENDED -> "ENDED"
+                        else -> "?$state"
+                    }
+                    Log.i(TAG, "🎬 '$title' state→$name (playing=${player.isPlaying} volume=${player.volume})")
+                }
+                override fun onIsPlayingChanged(isPlaying: Boolean) {
+                    Log.i(TAG, "🎬 '$title' isPlaying=$isPlaying")
+                }
+                override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
+                    Log.i(TAG, "🎬 '$title' videoSize=${videoSize.width}×${videoSize.height}")
+                }
             }
         )
         videoPlayers += player
@@ -1019,21 +1478,54 @@ class ImmersiveActivity : AppSystemActivity() {
             )
         )
 
-        // The Panel component binds the entity to the registered panel id. Transform + Scale
-        // place it in the world; the panel itself owns the rendered video surface.
+        // Orientation: Y-180 faces the panel toward the player (same correction every other
+        // panel uses). Scale is the raw saved scale — NO flip. A Scale(-1,-1,1) here rendered
+        // the content rotated 180° vs the web editor; plain scaleVec keeps it upright.
+        val videoCorrectedPose = Pose(pose.t, pose.q * Quaternion(0f, 180f, 0f))
+        val videoScale = scaleVec
         val videoEntity = Entity.create(
             Panel(panelId),
-            Transform(pose),
-            Scale(scaleVec),
+            Transform(videoCorrectedPose),
+            Scale(videoScale),
+            // VideoSurfacePanel entities are NOT ray-hittable by default (a mesh://quad gets
+            // MeshCollision.LineTest automatically; a Panel does not). Without this, clicking a
+            // wall video never reached the InputListener and the modal never opened.
+            Hittable(MeshCollision.LineTest),
         )
         entityRecords[videoEntity] = record
         entityKinds[videoEntity] = "video"
-        videoOriginals[videoEntity] = VideoOriginal(pose, scaleVec)
-        // Wire the video plane for click → "big preview" mode (see [showModalFor]). The Panel
-        // surface itself receives input events because VideoSurfacePanelRegistration installs
-        // a hittable mesh under the hood — same input path as the painting quads.
+        videoOriginals[videoEntity] = VideoOriginal(videoCorrectedPose, videoScale)
+        // Map entity → player so [showModalFor] can pull the right ExoPlayer to drive controls.
+        videoPlayerByEntity[videoEntity] = player
+        // Wire the video plane for click → modal video preview + info + controls.
         attachClickListener(videoEntity, title)
-        spawnGoldFrame(pose, scaleVec, 1.6f, 0.9f)
+        // Async: extract first-frame thumbnail via MediaMetadataRetriever and stash it as
+        // entityBitmaps[videoEntity] so the info panel can show a poster preview alongside
+        // the controls bar. Best-effort — if retrieval fails (network glitch / unsupported
+        // codec), the modal just won't show a poster, which matches pre-feature behavior.
+        scope.launch(Dispatchers.IO) {
+            runCatching {
+                val retriever = android.media.MediaMetadataRetriever()
+                try {
+                    retriever.setDataSource(url, hashMapOf())
+                    val frame = retriever.getFrameAtTime(0L, android.media.MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                    if (frame != null) {
+                        withContext(Dispatchers.Main) {
+                            entityBitmaps[videoEntity] = frame
+                            Log.i(TAG, "🖼️  poster bitmap ${frame.width}×${frame.height} for video '$title'")
+                        }
+                    }
+                } finally {
+                    retriever.release()
+                }
+            }.onFailure { e ->
+                Log.w(TAG, "✗ video poster extraction failed for '$title': ${e.message}")
+            }
+        }
+        // Gold frame around the video plane, coplanar with the CORRECTED pose so it sits in
+        // the same plane as the visible video face (not the original saved pose, which faces
+        // away from the player).
+        spawnGoldFrame(videoCorrectedPose, scaleVec, 1.6f, 0.9f)
     }
 
     /**
@@ -1291,6 +1783,7 @@ class ImmersiveActivity : AppSystemActivity() {
         scaleVec: Vector3,
         isEnvironment: Boolean,
         title: String,
+        record: SceneObjectRecord? = null,
     ) {
         val url = PocketBaseClient.fileUrl(asset, asset.file)
         if (isEnvironment) {
@@ -1327,22 +1820,42 @@ class ImmersiveActivity : AppSystemActivity() {
         // hint, streamed glb meshes can default to NoCollision until the mesh finishes
         // loading, which would make the entity un-grabbable even though the component is set.
         val hotspotDim = Vector3(0.4f, 0.4f, 0.4f)
+        // Sculpture GLB: STATIC physics (not DYNAMIC) so it doesn't fall through the floor.
+        // With DYNAMIC + density=0.5 + restitution=0.3 the sculpture immediately starts
+        // accelerating under gravity at scene-load time; the static gallery mesh collider has
+        // gaps (the floor mesh is a separate sub-shape from the walls), so the sculpture drops
+        // out of the world before the user even renders the first frame — matching the user's
+        // "dn vlepw to glb" report.
+        //
+        // KEEP Grabbable so the user can still pick the sculpture up — Grabbable + STATIC just
+        // means it doesn't fall on its own, but the grab gesture can still translate it (the
+        // toolkit's Grabbable handler bypasses physics state while held).
         val hotspotEntity = Entity.create(
             Mesh(Uri.parse(url), hittable = MeshCollision.LineTest),
             Transform(pose),
             Scale(scaleVec),
+            Visible(true),  // explicit so streamed mesh is forced visible even before its load future resolves
             Grabbable(true, GrabbableType.PIVOT_Y),
             Physics(
                 shape = "box",
-                state = PhysicsState.DYNAMIC,
+                state = PhysicsState.STATIC,
                 dimensions = hotspotDim,
                 density = 0.5f,
                 restitution = 0.3f,
             ),
         )
-        // Visual locator dot so the user can find the hotspot in the room — small floating
-        // gold beacon 0.6 m above the anchor pose (see spawnHotspotMarker).
-        spawnHotspotMarker(pose, scaleVec)
+        // Hotspot marker (small gold beacon above the sculpture) DISABLED — user reported the
+        // beacon as "kivo panw apo to glb" ("a cube above the GLB"); they don't want it.
+        // spawnHotspotMarker(pose, scaleVec)
+        // Modal for GLBs RE-ENABLED (user reversed: "to glb 8elw na anoigei ta info"). Click on
+        // the sculpture now opens the standard info panel with title + description from the
+        // PocketBase record — same panel as paintings/videos. The user can still GRAB the
+        // sculpture (Grabbable component above) — click and grab are different input events.
+        if (record != null) {
+            entityRecords[hotspotEntity] = record
+            entityKinds[hotspotEntity] = "model"
+        }
+        attachClickListener(hotspotEntity, title)
         Log.i(
             TAG,
             "🎯 hotspot glb '$title' id=${hotspotEntity.id} " +

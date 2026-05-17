@@ -8,4 +8,14 @@
          (>=2_000_000) are registered at runtime, mirroring the nextVideoPanelId pattern. This
          compile-time id is the registration "type" used as the base for the dynamic ids. -->
     <item name="audio_icon" type="id" />
+    <!-- Video playback controls panel (R.id.video_modal). Spawned hidden in onSceneReady,
+         shown when the user clicks a video plane: in-scene controls bar with play/pause,
+         scrub slider, volume toggle. Driven by [videoControlsState] in VideoControlsPanel.kt;
+         the panel is positioned in [showModalFor] below the enlarged video plane. Mirrors the
+         PremiumMediaSample ControlsPanel pattern. -->
+    <item name="video_modal" type="id" />
+    <!-- Floating "Back to scene picker" button. Pinned next to the mute button at eye level;
+         click bubbles into [backButtonOnClick] which hides exhibition objects and re-shows the
+         welcome scene picker. -->
+    <item name="back_button" type="id" />
 </resources>
